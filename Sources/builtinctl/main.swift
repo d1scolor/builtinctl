@@ -4,17 +4,20 @@ import Darwin
 import Dispatch
 import Foundation
 
-private let version = "0.1.2"
+private let version = "0.1.3"
 
 private func yesNo(_ value: Bool) -> String { value ? "yes" : "no" }
 
-private func daemonState() -> (running: Bool, safeMode: Bool) {
+private func daemonState() -> (running: Bool, safeModeRemaining: Int?) {
     guard let text = try? String(contentsOf: BuiltinCtlPaths.pid),
           let pid = Int32(text.trimmingCharacters(in: .whitespacesAndNewlines)),
-          kill(pid, 0) == 0 else { return (false, false) }
+          kill(pid, 0) == 0 else { return (false, nil) }
     let safeUntil = (try? String(contentsOf: BuiltinCtlPaths.safeUntil))
         .flatMap { TimeInterval($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
-    return (true, safeUntil.map { Date().timeIntervalSince1970 < $0 } ?? false)
+    let remaining = safeUntil.map {
+        max(0, Int(ceil($0 - Date().timeIntervalSince1970)))
+    }
+    return (true, remaining.flatMap { $0 > 0 ? $0 : nil })
 }
 
 private func status(_ display: DisplayController) throws {
@@ -32,8 +35,10 @@ private func status(_ display: DisplayController) throws {
     print("Automation:")
     print("  Suspended:     \(yesNo(BuiltinCtlPaths.isSuspended))")
     print("  Recovery pending: \(yesNo(BuiltinCtlPaths.hasDisabledState))")
+    print("  Reconnect required: \(yesNo(BuiltinCtlPaths.isRecoveryLatched))")
     print("  Daemon:        \(daemon.running ? "running" : "stopped")")
-    print("  Safe mode:     \(yesNo(daemon.safeMode))\n")
+    let safeMode = daemon.safeModeRemaining.map { "yes (\($0)s remaining)" } ?? "no"
+    print("  Safe mode:     \(safeMode)\n")
     print("Private API:")
     print("  Available:     \(yesNo(display.privateAPIAvailable))")
 }
@@ -155,10 +160,18 @@ do {
         if BuiltinCtlPaths.hasDisabledState {
             try enableAndClearRecovery(display)
         }
+        // Write before removing the kill switch. A running daemon consumes only
+        // requests newer than its own start; a future daemon ignores this as stale.
+        try BuiltinCtlPaths.requestRearm()
         if FileManager.default.fileExists(atPath: BuiltinCtlPaths.disabled.path) {
             try FileManager.default.removeItem(at: BuiltinCtlPaths.disabled)
         }
         print("Automatic built-in display switching resumed.")
+        if daemonState().running {
+            print("Running automation explicitly re-armed; startup grace and reconnect latch will be cleared.")
+        } else {
+            print("No automation process is running; its next start will retain the startup safety window.")
+        }
     case "watch": try watch(display)
     case "test-off": try testOff(display)
     case "install-agent":

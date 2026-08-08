@@ -36,7 +36,7 @@ builtinctl off      disable it (refuses unless an external display is active)
 builtinctl auto     run automatic switching in the foreground
 builtinctl suspend  activate the kill switch and immediately restore the panel
 builtinctl recover  alias for suspend, intended for emergency recovery
-builtinctl resume   remove the safety kill switch
+builtinctl resume   remove the kill switch and explicitly re-arm a running daemon
 builtinctl watch    print CoreGraphics display events without changing displays
 builtinctl test-off safely test disable with a 15-second confirmation timeout
 builtinctl install-agent   install and start a suspended per-user LaunchAgent
@@ -44,7 +44,7 @@ builtinctl uninstall-agent restore, suspend, and remove the LaunchAgent
 builtinctl purge           restore, remove automation, configuration, and logs
 ```
 
-Automatic mode first attempts to enable the panel and enforces a 60-second recovery window. It then uses CoreGraphics callbacks with a two-second safety watchdog. All changes are session-only; logout or restart should discard them. `SIGINT`, `SIGTERM`, `SIGHUP`, and `SIGQUIT` restore the built-in display before exit.
+Automatic mode first attempts to enable the panel and enforces a 60-second recovery window. An explicit `resume` re-arms a running daemon immediately, clearing the remaining startup grace and any reconnect latch. Automatic mode then uses CoreGraphics callbacks with a two-second safety watchdog. All changes are session-only; logout or restart should discard them. `SIGINT`, `SIGTERM`, `SIGHUP`, and `SIGQUIT` restore the built-in display before exit.
 
 Automatic mode keeps its event loop isolated from private display mutations. Each transition runs through a short-lived internal helper with a five-second timeout and a cross-process mutation lock. Disabling requires a freshly confirmed active external display, a durable built-in recovery ID, and an inactive kill switch. These conditions are checked again after beginning the transaction and immediately before the private call. The helper verifies the result and reverses an unsafe post-condition. After automatic restoration, a recovery latch prevents another disable until an absent external and subsequent reconnect have both been observed.
 
@@ -62,7 +62,7 @@ Before any disable, builtinctl durably writes:
 
 It removes this marker only after the built-in is verified active. The LaunchAgent restarts only after an unsuccessful exit. A restarted process that finds the marker restores the panel, creates the persistent suspension sentinel, and continues in fail-open suspended mode. It never automatically rearms after a crash.
 
-Only one `auto` process may hold the automation lock. All display mutations also share a separate lock, preventing a late `off` helper from racing crash recovery. On wake, automatic mode restores the built-in and starts a fresh 15-second recovery window.
+Only one `auto` process may hold the automation lock. All display mutations also share a separate lock, preventing a late `off` helper from racing crash recovery. Display sleep pauses topology evaluation so temporarily inactive displays are not mistaken for an unplug. On display or system wake, automatic mode restores the built-in and starts a fresh 15-second recovery window.
 
 ## Safe first run
 

@@ -3,6 +3,20 @@ import XCTest
 @testable import BuiltinCtlCore
 
 final class LifecycleTests: XCTestCase {
+    func testRearmRequestMustBeNewerThanTheDaemon() {
+        let startedAt = Date(timeIntervalSince1970: 1_000)
+
+        XCTAssertTrue(
+            BuiltinCtlPaths.rearmRequestIsCurrent("1001\n", startedAt: startedAt)
+        )
+        XCTAssertFalse(
+            BuiltinCtlPaths.rearmRequestIsCurrent("999\n", startedAt: startedAt)
+        )
+        XCTAssertFalse(
+            BuiltinCtlPaths.rearmRequestIsCurrent("invalid\n", startedAt: startedAt)
+        )
+    }
+
     func testCurrentExecutableLocatorReturnsAnAbsoluteExecutablePath() {
         let executable = ExecutableLocator.current()
 

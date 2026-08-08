@@ -14,6 +14,8 @@ public enum BuiltinCtlPaths {
     public static var pid: URL { configDirectory.appendingPathComponent("auto.pid") }
     public static var started: URL { configDirectory.appendingPathComponent("auto.started") }
     public static var safeUntil: URL { configDirectory.appendingPathComponent("auto.safe-until") }
+    public static var rearmRequest: URL { configDirectory.appendingPathComponent("auto.rearm") }
+    public static var recoveryLatch: URL { configDirectory.appendingPathComponent("auto.recovery-latched") }
 
     public static func ensureDirectory() throws {
         try FileManager.default.createDirectory(at: configDirectory, withIntermediateDirectories: true)
@@ -25,6 +27,10 @@ public enum BuiltinCtlPaths {
 
     public static var hasDisabledState: Bool {
         FileManager.default.fileExists(atPath: disabledState.path)
+    }
+
+    public static var isRecoveryLatched: Bool {
+        FileManager.default.fileExists(atPath: recoveryLatch.path)
     }
 
     public static func writeAtomically(_ text: String, to url: URL) throws {
@@ -54,6 +60,34 @@ public enum BuiltinCtlPaths {
     public static func clearBuiltinDisabledMarker() throws {
         if FileManager.default.fileExists(atPath: disabledState.path) {
             try FileManager.default.removeItem(at: disabledState)
+        }
+    }
+
+    public static func requestRearm() throws {
+        try writeAtomically("\(Date().timeIntervalSince1970)\n", to: rearmRequest)
+    }
+
+    static func consumeRearmRequest(startedAt: Date) throws -> Bool {
+        guard FileManager.default.fileExists(atPath: rearmRequest.path) else { return false }
+        let text = try String(contentsOf: rearmRequest)
+        defer { try? FileManager.default.removeItem(at: rearmRequest) }
+        return rearmRequestIsCurrent(text, startedAt: startedAt)
+    }
+
+    static func rearmRequestIsCurrent(_ text: String, startedAt: Date) -> Bool {
+        guard let requestedAt = TimeInterval(
+            text.trimmingCharacters(in: .whitespacesAndNewlines)
+        ) else { return false }
+        return requestedAt >= startedAt.timeIntervalSince1970
+    }
+
+    public static func markRecoveryLatched() throws {
+        try writeAtomically("latched\n", to: recoveryLatch)
+    }
+
+    public static func clearRecoveryLatch() throws {
+        if FileManager.default.fileExists(atPath: recoveryLatch.path) {
+            try FileManager.default.removeItem(at: recoveryLatch)
         }
     }
 }

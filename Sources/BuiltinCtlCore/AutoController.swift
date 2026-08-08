@@ -20,7 +20,8 @@ public final class AutoController {
     private var disablingExternalIDs: Set<CGDirectDisplayID> = []
     private var stopping = false
     private var processLock: ProcessLock?
-    private var wakeObserver: NSObjectProtocol?
+    private var workspaceObservers: [NSObjectProtocol] = []
+    private var displaysAsleep = false
 
     public init(
         display: DisplayController = DisplayController(),
@@ -39,6 +40,7 @@ public final class AutoController {
         try BuiltinCtlPaths.writeAtomically("\(getpid())\n", to: BuiltinCtlPaths.pid)
         try BuiltinCtlPaths.writeAtomically("\(startedAt.timeIntervalSince1970)\n", to: BuiltinCtlPaths.started)
         try BuiltinCtlPaths.writeAtomically("\(disableAllowedAt.timeIntervalSince1970)\n", to: BuiltinCtlPaths.safeUntil)
+        try? BuiltinCtlPaths.clearRecoveryLatch()
 
         logger.log("builtinctl starting")
         if BuiltinCtlPaths.hasDisabledState {
@@ -71,7 +73,7 @@ public final class AutoController {
         }
         try watcher?.start()
         installSignalHandlers()
-        installWakeObserver()
+        installWorkspaceObservers()
 
         let timer = DispatchSource.makeTimerSource(queue: .main)
         timer.schedule(deadline: .now() + 2, repeating: 2)
@@ -94,6 +96,12 @@ public final class AutoController {
 
     private func evaluate() {
         guard !stopping else { return }
+        applyExplicitRearmIfRequested()
+        guard !displaysAsleep else {
+            let summary = "displays-asleep=true automation-paused=true"
+            if summary != lastSummary { logger.log(summary); lastSummary = summary }
+            return
+        }
         do {
             let snapshot = try display.snapshot()
             let armed = Date() >= disableAllowedAt
@@ -109,7 +117,7 @@ public final class AutoController {
             // from producing an enable/disable loop.
             if waitingForExternalReconnect && snapshot.builtinActive {
                 if snapshot.activeExternals.isEmpty {
-                    waitingForExternalReconnect = false
+                    setRecoveryLatched(false)
                     logger.log("external removal confirmed; automation ready for reconnect")
                 } else {
                     let summary = "builtin=true externals=\(snapshot.activeExternals.count) source=cg recovery-latched=true armed=\(armed) suspended=\(suspended)"
@@ -136,7 +144,7 @@ public final class AutoController {
                 logger.log("built-in disabled id=\(snapshot.builtin!)")
             } else if desired == .enabled && !state.builtinActive && state.builtinFound {
                 try restoreBuiltin()
-                waitingForExternalReconnect = true
+                setRecoveryLatched(true)
                 logger.log("built-in enabled id=\(snapshot.builtin!)")
             } else if desired == .enabled && state.builtinActive && BuiltinCtlPaths.hasDisabledState {
                 try BuiltinCtlPaths.clearBuiltinDisabledMarker()
@@ -146,10 +154,39 @@ public final class AutoController {
             logger.log("evaluation error: \(error.localizedDescription)")
             do {
                 try restoreBuiltin()
-                waitingForExternalReconnect = true
+                setRecoveryLatched(true)
             } catch {
                 logger.log("fail-open restore warning: \(error.localizedDescription)")
             }
+        }
+    }
+
+    private func applyExplicitRearmIfRequested() {
+        do {
+            guard try BuiltinCtlPaths.consumeRearmRequest(startedAt: startedAt) else { return }
+            disableAllowedAt = Date()
+            try BuiltinCtlPaths.writeAtomically(
+                "\(disableAllowedAt.timeIntervalSince1970)\n",
+                to: BuiltinCtlPaths.safeUntil
+            )
+            setRecoveryLatched(false)
+            lastSummary = nil
+            logger.log("explicit resume received; startup grace and recovery latch cleared")
+        } catch {
+            logger.log("resume request warning: \(error.localizedDescription)")
+        }
+    }
+
+    private func setRecoveryLatched(_ latched: Bool) {
+        waitingForExternalReconnect = latched
+        do {
+            if latched {
+                try BuiltinCtlPaths.markRecoveryLatched()
+            } else {
+                try BuiltinCtlPaths.clearRecoveryLatch()
+            }
+        } catch {
+            logger.log("recovery latch state warning: \(error.localizedDescription)")
         }
     }
 
@@ -219,19 +256,44 @@ public final class AutoController {
         }
     }
 
-    private func installWakeObserver() {
-        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+    private func installWorkspaceObservers() {
+        let center = NSWorkspace.shared.notificationCenter
+        workspaceObservers.append(center.addObserver(
             forName: NSWorkspace.didWakeNotification,
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            self?.handleWake()
-        }
+            self?.handleWake(reason: "system wake")
+        })
+        workspaceObservers.append(center.addObserver(
+            forName: NSWorkspace.screensDidSleepNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.handleDisplaysSleep()
+        })
+        workspaceObservers.append(center.addObserver(
+            forName: NSWorkspace.screensDidWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.handleWake(reason: "display wake")
+        })
     }
 
-    private func handleWake() {
+    private func handleDisplaysSleep() {
+        guard !stopping, !displaysAsleep else { return }
+        displaysAsleep = true
+        pending?.cancel()
+        lastSummary = nil
+        logger.log("displays sleeping; topology evaluation paused")
+    }
+
+    private func handleWake(reason: String) {
         guard !stopping else { return }
-        logger.log("system wake; restoring built-in and entering 15s recovery window")
+        displaysAsleep = false
+        lastSummary = nil
+        logger.log("\(reason); restoring built-in and entering 15s recovery window")
         disableAllowedAt = Date().addingTimeInterval(15)
         try? BuiltinCtlPaths.writeAtomically(
             "\(disableAllowedAt.timeIntervalSince1970)\n",
@@ -239,7 +301,7 @@ public final class AutoController {
         )
         do {
             try restoreBuiltin()
-            waitingForExternalReconnect = false
+            setRecoveryLatched(false)
         } catch {
             logger.log("wake restore failed; automation suspended: \(error.localizedDescription)")
             try? BuiltinCtlPaths.suspend(reason: "wake-restore-failed")
@@ -251,10 +313,10 @@ public final class AutoController {
         pending?.cancel()
         watchdog?.cancel()
         watcher?.stop()
-        if let wakeObserver {
-            NSWorkspace.shared.notificationCenter.removeObserver(wakeObserver)
-            self.wakeObserver = nil
+        for observer in workspaceObservers {
+            NSWorkspace.shared.notificationCenter.removeObserver(observer)
         }
+        workspaceObservers.removeAll()
         var exitStatus: Int32 = 0
         do {
             try restoreBuiltin()
@@ -266,6 +328,8 @@ public final class AutoController {
         try? FileManager.default.removeItem(at: BuiltinCtlPaths.pid)
         try? FileManager.default.removeItem(at: BuiltinCtlPaths.started)
         try? FileManager.default.removeItem(at: BuiltinCtlPaths.safeUntil)
+        try? FileManager.default.removeItem(at: BuiltinCtlPaths.rearmRequest)
+        try? BuiltinCtlPaths.clearRecoveryLatch()
         logger.log("stopping on signal \(number)")
         Darwin.exit(exitStatus)
     }
