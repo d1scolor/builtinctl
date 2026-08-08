@@ -9,6 +9,7 @@ public final class AutoController {
     private let display: DisplayController
     private let logger: Logger
     private let executableURL: URL
+    private let runningVersion: String
     private let startedAt = Date()
     private var disableAllowedAt: Date
     private var watcher: DisplayWatcher?
@@ -26,12 +27,14 @@ public final class AutoController {
     public init(
         display: DisplayController = DisplayController(),
         logger: Logger = Logger(),
-        executableURL: URL? = nil
+        executableURL: URL? = nil,
+        runningVersion: String = "development"
     ) {
         self.display = display
         self.logger = logger
         self.disableAllowedAt = Date().addingTimeInterval(Self.startupGrace)
         self.executableURL = executableURL ?? ExecutableLocator.current()
+        self.runningVersion = runningVersion
     }
 
     public func run() throws -> Never {
@@ -40,6 +43,7 @@ public final class AutoController {
         try BuiltinCtlPaths.writeAtomically("\(getpid())\n", to: BuiltinCtlPaths.pid)
         try BuiltinCtlPaths.writeAtomically("\(startedAt.timeIntervalSince1970)\n", to: BuiltinCtlPaths.started)
         try BuiltinCtlPaths.writeAtomically("\(disableAllowedAt.timeIntervalSince1970)\n", to: BuiltinCtlPaths.safeUntil)
+        try BuiltinCtlPaths.writeAtomically("\(runningVersion)\n", to: BuiltinCtlPaths.agentVersion)
         try? BuiltinCtlPaths.clearRecoveryLatch()
 
         logger.log("builtinctl starting")
@@ -328,6 +332,7 @@ public final class AutoController {
         try? FileManager.default.removeItem(at: BuiltinCtlPaths.pid)
         try? FileManager.default.removeItem(at: BuiltinCtlPaths.started)
         try? FileManager.default.removeItem(at: BuiltinCtlPaths.safeUntil)
+        try? FileManager.default.removeItem(at: BuiltinCtlPaths.agentVersion)
         try? FileManager.default.removeItem(at: BuiltinCtlPaths.rearmRequest)
         try? BuiltinCtlPaths.clearRecoveryLatch()
         logger.log("stopping on signal \(number)")

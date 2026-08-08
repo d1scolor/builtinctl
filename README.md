@@ -40,6 +40,7 @@ builtinctl resume   remove the kill switch and explicitly re-arm a running daemo
 builtinctl watch    print CoreGraphics display events without changing displays
 builtinctl test-off safely test disable with a 15-second confirmation timeout
 builtinctl install-agent   install and start a suspended per-user LaunchAgent
+builtinctl restart-agent   safely restart on the current CLI, preserving suspension
 builtinctl uninstall-agent restore, suspend, and remove the LaunchAgent
 builtinctl purge           restore, remove automation, configuration, and logs
 ```
@@ -84,7 +85,7 @@ After hardware testing:
 builtinctl install-agent
 ```
 
-This copies the executable to `~/Library/Application Support/builtinctl/bin`, installs `~/Library/LaunchAgents/io.github.builtinctl.auto.plist`, and bootstraps it. Installation first restores the built-in and creates the suspension sentinel, so switching is not silently enabled. Explicitly opt in with:
+This installs a persistent launcher and fallback executable under `~/Library/Application Support/builtinctl/bin`, installs `~/Library/LaunchAgents/io.github.builtinctl.auto.plist`, and bootstraps it. When installed through Homebrew, the launcher records Homebrew's stable `opt` path and creates a private versioned runtime copy at each daemon start. Installation first restores the built-in and creates the suspension sentinel, so switching is not silently enabled. Explicitly opt in with:
 
 ```sh
 builtinctl resume
@@ -94,15 +95,20 @@ Logs are written under `~/Library/Logs/builtinctl`. The agent uses conditional `
 
 ## Upgrade
 
-The LaunchAgent runs a safety copy of the executable rather than a versioned Homebrew Cellar path. Refresh that copy after upgrading:
+The running daemon is not interrupted during a Homebrew upgrade. At its next start—such as the next login or reboot—the persistent launcher automatically snapshots and runs the current Homebrew version. No agent reinstall is required:
 
 ```sh
 brew upgrade builtinctl
-builtinctl install-agent
-builtinctl resume
+builtinctl status
 ```
 
-`install-agent` restores the built-in and reinstalls the agent suspended, so `resume` remains an explicit opt-in.
+To apply an update immediately, safely restore and restart the agent while preserving whether automation is enabled or suspended:
+
+```sh
+builtinctl restart-agent
+```
+
+Agents installed before version 0.1.4 require one final `restart-agent` to migrate their executable and LaunchAgent configuration. Subsequent Homebrew upgrades apply automatically at the next daemon start. `status` reports the CLI version, running agent version, and whether an update is pending.
 
 ## Recovery
 

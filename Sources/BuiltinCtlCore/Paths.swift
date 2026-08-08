@@ -14,6 +14,7 @@ public enum BuiltinCtlPaths {
     public static var pid: URL { configDirectory.appendingPathComponent("auto.pid") }
     public static var started: URL { configDirectory.appendingPathComponent("auto.started") }
     public static var safeUntil: URL { configDirectory.appendingPathComponent("auto.safe-until") }
+    public static var agentVersion: URL { configDirectory.appendingPathComponent("auto.version") }
     public static var rearmRequest: URL { configDirectory.appendingPathComponent("auto.rearm") }
     public static var recoveryLatch: URL { configDirectory.appendingPathComponent("auto.recovery-latched") }
 

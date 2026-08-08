@@ -4,20 +4,32 @@ import Darwin
 import Dispatch
 import Foundation
 
-private let version = "0.1.3"
+private let version = "0.1.4"
 
 private func yesNo(_ value: Bool) -> String { value ? "yes" : "no" }
 
-private func daemonState() -> (running: Bool, safeModeRemaining: Int?) {
+private struct DaemonState {
+    let running: Bool
+    let safeModeRemaining: Int?
+    let version: String?
+}
+
+private func daemonState() -> DaemonState {
     guard let text = try? String(contentsOf: BuiltinCtlPaths.pid),
           let pid = Int32(text.trimmingCharacters(in: .whitespacesAndNewlines)),
-          kill(pid, 0) == 0 else { return (false, nil) }
+          kill(pid, 0) == 0 else { return DaemonState(running: false, safeModeRemaining: nil, version: nil) }
     let safeUntil = (try? String(contentsOf: BuiltinCtlPaths.safeUntil))
         .flatMap { TimeInterval($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
     let remaining = safeUntil.map {
         max(0, Int(ceil($0 - Date().timeIntervalSince1970)))
     }
-    return (true, remaining.flatMap { $0 > 0 ? $0 : nil })
+    let agentVersion = (try? String(contentsOf: BuiltinCtlPaths.agentVersion))?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    return DaemonState(
+        running: true,
+        safeModeRemaining: remaining.flatMap { $0 > 0 ? $0 : nil },
+        version: agentVersion?.isEmpty == false ? agentVersion : nil
+    )
 }
 
 private func status(_ display: DisplayController) throws {
@@ -37,6 +49,18 @@ private func status(_ display: DisplayController) throws {
     print("  Recovery pending: \(yesNo(BuiltinCtlPaths.hasDisabledState))")
     print("  Reconnect required: \(yesNo(BuiltinCtlPaths.isRecoveryLatched))")
     print("  Daemon:        \(daemon.running ? "running" : "stopped")")
+    let agentVersion = daemon.running ? (daemon.version ?? "unknown (legacy agent)") : "not running"
+    let updatePending: String
+    if !daemon.running {
+        updatePending = "no"
+    } else if let runningVersion = daemon.version {
+        updatePending = yesNo(runningVersion != version)
+    } else {
+        updatePending = "unknown"
+    }
+    print("  CLI version:   \(version)")
+    print("  Agent version: \(agentVersion)")
+    print("  Update pending: \(updatePending)")
     let safeMode = daemon.safeModeRemaining.map { "yes (\($0)s remaining)" } ?? "no"
     print("  Safe mode:     \(safeMode)\n")
     print("Private API:")
@@ -86,7 +110,50 @@ private extension String {
 }
 
 private func usage() {
-    print("Usage: builtinctl <status|on|off|auto|suspend|recover|resume|watch|test-off|install-agent|uninstall-agent|purge>")
+    print("Usage: builtinctl <status|on|off|auto|suspend|recover|resume|watch|test-off|install-agent|restart-agent|uninstall-agent|purge>")
+}
+
+private func execAutomaticMode(_ executable: URL) throws -> Never {
+    let values = [executable.path, "auto"]
+    var pointers = values.map { strdup($0) }
+    guard pointers.allSatisfy({ $0 != nil }) else {
+        pointers.compactMap { $0 }.forEach { free($0) }
+        throw NSError(
+            domain: NSPOSIXErrorDomain,
+            code: Int(ENOMEM),
+            userInfo: [NSLocalizedDescriptionKey: "Could not allocate automatic-mode arguments."]
+        )
+    }
+    defer { pointers.compactMap { $0 }.forEach { free($0) } }
+    pointers.append(nil)
+    pointers.withUnsafeMutableBufferPointer { arguments in
+        _ = execv(arguments[0], arguments.baseAddress)
+    }
+    let code = errno
+    throw NSError(
+        domain: NSPOSIXErrorDomain,
+        code: Int(code),
+        userInfo: [NSLocalizedDescriptionKey: "Could not launch current agent executable: \(String(cString: strerror(code)))."]
+    )
+}
+
+private func automaticMode(_ display: DisplayController, usePreferredExecutable: Bool) throws -> Never {
+    let current = ExecutableLocator.current()
+    if usePreferredExecutable {
+        do {
+            let preferred = try AgentManager.prepareAutomaticExecutable(fallback: current)
+            if preferred.path != current.path {
+                try execAutomaticMode(preferred)
+            }
+        } catch {
+            fputs("Agent update fallback: \(error.localizedDescription)\n", stderr)
+        }
+    }
+    try AutoController(
+        display: display,
+        executableURL: current,
+        runningVersion: version
+    ).run()
 }
 
 private func suspendAndRestore(_ display: DisplayController, reason: String) throws {
@@ -151,7 +218,7 @@ do {
     case "off":
         try disableWithRecoveryMarker(display)
         print("Built-in display disabled.")
-    case "auto": try AutoController(display: display).run()
+    case "auto": try automaticMode(display, usePreferredExecutable: false)
     case "suspend", "recover":
         try suspendAndRestore(display, reason: command == "recover" ? "recovery" : "user")
         print("Automatic built-in display switching suspended.")
@@ -179,6 +246,22 @@ do {
         try AgentManager().install(executable: ExecutableLocator.current())
         print("LaunchAgent installed and started in suspended mode.")
         print("Run '\(AgentManager.installedExecutable.path) resume' when you are ready to enable automatic switching.")
+    case "restart-agent":
+        let manager = AgentManager()
+        guard manager.isInstalled else {
+            throw AgentManagerError.command("LaunchAgent is not installed; run 'builtinctl install-agent' first.")
+        }
+        let wasSuspended = BuiltinCtlPaths.isSuspended
+        try suspendAndRestore(display, reason: "agent-restart")
+        try manager.install(executable: ExecutableLocator.current())
+        if !wasSuspended {
+            try BuiltinCtlPaths.requestRearm()
+            if FileManager.default.fileExists(atPath: BuiltinCtlPaths.disabled.path) {
+                try FileManager.default.removeItem(at: BuiltinCtlPaths.disabled)
+            }
+        }
+        print("LaunchAgent updated and restarted with builtinctl \(version).")
+        print(wasSuspended ? "Automation remains suspended." : "Automation state restored and explicitly re-armed.")
     case "uninstall-agent":
         try suspendAndRestore(display, reason: "uninstalled")
         try AgentManager().uninstall()
@@ -191,6 +274,7 @@ do {
         print("The package-manager CLI remains installed; remove it separately if desired.")
     case "_auto-on": try enableAndClearRecovery(display)
     case "_auto-off": try disableWithRecoveryMarker(display, requireAutomationAllowed: true)
+    case "_launch-auto": try automaticMode(display, usePreferredExecutable: true)
     case "--version", "version": print("builtinctl \(version)")
     default: usage(); exit(64)
     }

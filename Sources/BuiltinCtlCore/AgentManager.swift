@@ -33,6 +33,12 @@ public struct AgentManager {
     public static var installedExecutable: URL {
         applicationDirectory.appendingPathComponent("bin/builtinctl")
     }
+    public static var runtimeVersionsDirectory: URL {
+        applicationDirectory.appendingPathComponent("bin/versions", isDirectory: true)
+    }
+    public static var updateSourceURL: URL {
+        applicationDirectory.appendingPathComponent("update-source")
+    }
     public static var logsDirectory: URL {
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Logs/builtinctl", isDirectory: true)
@@ -43,6 +49,10 @@ public struct AgentManager {
     }
 
     private var domain: String { "gui/\(getuid())" }
+
+    public var isInstalled: Bool {
+        FileManager.default.fileExists(atPath: Self.plistURL.path)
+    }
 
     public init() {}
 
@@ -66,6 +76,7 @@ public struct AgentManager {
         let binary = try Data(contentsOf: source)
         try binary.write(to: Self.installedExecutable, options: .atomic)
         try manager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: Self.installedExecutable.path)
+        try Self.configureUpdateSource(for: source, fileManager: manager)
 
         let plistData = try PropertyListSerialization.data(
             fromPropertyList: Self.propertyList(),
@@ -75,13 +86,15 @@ public struct AgentManager {
         try plistData.write(to: Self.plistURL, options: .atomic)
         try manager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: Self.plistURL.path)
 
+        try? manager.removeItem(at: BuiltinCtlPaths.pid)
         try launchctl(["bootstrap", domain, Self.plistURL.path])
+        try waitForAgentStart()
     }
 
     static func propertyList() -> [String: Any] {
         [
             "Label": Self.label,
-            "ProgramArguments": [Self.installedExecutable.path, "auto"],
+            "ProgramArguments": [Self.installedExecutable.path, "_launch-auto"],
             "RunAtLoad": true,
             "KeepAlive": ["SuccessfulExit": false],
             "ThrottleInterval": 10,
@@ -99,9 +112,88 @@ public struct AgentManager {
         if manager.fileExists(atPath: Self.plistURL.path) {
             try manager.removeItem(at: Self.plistURL)
         }
-        if manager.fileExists(atPath: Self.installedExecutable.path) {
-            try manager.removeItem(at: Self.installedExecutable)
+        if manager.fileExists(atPath: Self.applicationDirectory.path) {
+            try manager.removeItem(at: Self.applicationDirectory)
         }
+    }
+
+    /// Prepare a persistent runtime copy of the currently linked Homebrew
+    /// executable. The running controller and all of its helpers then use this
+    /// immutable copy even if Homebrew cleans up the old Cellar during upgrade.
+    public static func prepareAutomaticExecutable(
+        fileManager manager: FileManager = .default,
+        fallback: URL = installedExecutable,
+        sourceRecordURL: URL = AgentManager.updateSourceURL,
+        versionsDirectory: URL = AgentManager.runtimeVersionsDirectory
+    ) throws -> URL {
+        guard manager.fileExists(atPath: sourceRecordURL.path),
+              let text = try? String(contentsOf: sourceRecordURL),
+              !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return fallback
+        }
+
+        let source = URL(
+            fileURLWithPath: text.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
+        guard manager.isExecutableFile(atPath: source.path) else { return fallback }
+        let resolved = source.resolvingSymlinksInPath()
+        guard let identifier = homebrewVersionIdentifier(for: resolved) else { return fallback }
+
+        let runtime = versionsDirectory
+            .appendingPathComponent(identifier, isDirectory: true)
+            .appendingPathComponent("builtinctl")
+        try manager.createDirectory(
+            at: runtime.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+
+        let sourceData = try Data(contentsOf: resolved)
+        let runtimeData = try? Data(contentsOf: runtime)
+        if runtimeData != sourceData {
+            try sourceData.write(to: runtime, options: .atomic)
+        }
+        try manager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: runtime.path)
+        guard manager.isExecutableFile(atPath: runtime.path) else {
+            throw AgentManagerError.command("Prepared agent executable is not executable: \(runtime.path)")
+        }
+        return runtime
+    }
+
+    static func stableHomebrewExecutable(for source: URL) -> URL? {
+        let resolved = source.standardizedFileURL.resolvingSymlinksInPath()
+        let marker = "/Cellar/builtinctl/"
+        guard let range = resolved.path.range(of: marker) else { return nil }
+        let prefix = String(resolved.path[..<range.lowerBound])
+        guard !prefix.isEmpty else { return nil }
+        return URL(fileURLWithPath: prefix, isDirectory: true)
+            .appendingPathComponent("opt/builtinctl/bin/builtinctl")
+    }
+
+    static func homebrewVersionIdentifier(for source: URL) -> String? {
+        let components = source.standardizedFileURL.pathComponents
+        guard let cellar = components.firstIndex(of: "Cellar"),
+              components.indices.contains(cellar + 2),
+              components[cellar + 1] == "builtinctl" else { return nil }
+        let version = components[cellar + 2]
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: ".-_"))
+        guard !version.isEmpty, version.unicodeScalars.allSatisfy(allowed.contains) else { return nil }
+        return version
+    }
+
+    private static func configureUpdateSource(
+        for source: URL,
+        fileManager manager: FileManager
+    ) throws {
+        guard let stable = stableHomebrewExecutable(for: source),
+              manager.isExecutableFile(atPath: stable.path),
+              stable.resolvingSymlinksInPath() == source.resolvingSymlinksInPath() else {
+            if manager.fileExists(atPath: updateSourceURL.path) {
+                try manager.removeItem(at: updateSourceURL)
+            }
+            return
+        }
+        try Data("\(stable.path)\n".utf8).write(to: updateSourceURL, options: .atomic)
+        try manager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: updateSourceURL.path)
     }
 
     /// Remove all per-user builtinctl data after the caller has restored and
@@ -142,6 +234,19 @@ public struct AgentManager {
         throw AgentManagerError.command(
             "Could not verify that the LaunchAgent stopped; refusing to remove recovery files: \(verification.detail)"
         )
+    }
+
+    private func waitForAgentStart(timeout: TimeInterval = 5) throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        repeat {
+            if let text = try? String(contentsOf: BuiltinCtlPaths.pid),
+               let pid = Int32(text.trimmingCharacters(in: .whitespacesAndNewlines)),
+               kill(pid, 0) == 0 {
+                return
+            }
+            Thread.sleep(forTimeInterval: 0.05)
+        } while Date() < deadline
+        throw AgentManagerError.command("LaunchAgent did not report a running process within \(Int(timeout)) seconds.")
     }
 
     static func serviceIsMissing(status: Int32, output: String) -> Bool {

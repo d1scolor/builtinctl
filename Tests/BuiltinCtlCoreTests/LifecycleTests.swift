@@ -80,11 +80,75 @@ final class LifecycleTests: XCTestCase {
         XCTAssertEqual(keepAlive["SuccessfulExit"], false)
     }
 
-    func testAgentStartsSuspendedAutoCommandFromStablePath() throws {
+    func testAgentStartsPersistentLauncherFromStablePath() throws {
         let plist = AgentManager.propertyList()
         let arguments = try XCTUnwrap(plist["ProgramArguments"] as? [String])
-        XCTAssertEqual(arguments.last, "auto")
+        XCTAssertEqual(arguments.last, "_launch-auto")
         XCTAssertEqual(arguments.first, AgentManager.installedExecutable.path)
+    }
+
+    func testDerivesStableHomebrewOptExecutable() {
+        let source = URL(
+            fileURLWithPath: "/opt/homebrew/Cellar/builtinctl/0.1.4/bin/builtinctl"
+        )
+
+        XCTAssertEqual(
+            AgentManager.stableHomebrewExecutable(for: source)?.path,
+            "/opt/homebrew/opt/builtinctl/bin/builtinctl"
+        )
+        XCTAssertEqual(AgentManager.homebrewVersionIdentifier(for: source), "0.1.4")
+        XCTAssertNil(
+            AgentManager.stableHomebrewExecutable(
+                for: URL(fileURLWithPath: "/tmp/builtinctl")
+            )
+        )
+    }
+
+    func testPreparesPersistentVersionedRuntimeCopy() throws {
+        let manager = FileManager.default
+        let root = manager.temporaryDirectory
+            .appendingPathComponent("builtinctl-runtime-\(UUID().uuidString)", isDirectory: true)
+        let source = root.appendingPathComponent("Cellar/builtinctl/0.1.4/bin/builtinctl")
+        let fallback = root.appendingPathComponent("fallback/builtinctl")
+        let sourceRecord = root.appendingPathComponent("update-source")
+        let versions = root.appendingPathComponent("versions", isDirectory: true)
+        defer { try? manager.removeItem(at: root) }
+
+        for executable in [source, fallback] {
+            try manager.createDirectory(
+                at: executable.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try Data(executable == source ? "new".utf8 : "fallback".utf8).write(to: executable)
+            try manager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+        }
+        try Data("\(source.path)\n".utf8).write(to: sourceRecord)
+
+        let prepared = try AgentManager.prepareAutomaticExecutable(
+            fileManager: manager,
+            fallback: fallback,
+            sourceRecordURL: sourceRecord,
+            versionsDirectory: versions
+        )
+
+        XCTAssertEqual(prepared.path, versions.appendingPathComponent("0.1.4/builtinctl").path)
+        XCTAssertEqual(try Data(contentsOf: prepared), Data("new".utf8))
+        XCTAssertTrue(manager.isExecutableFile(atPath: prepared.path))
+    }
+
+    func testAutomaticExecutableFallsBackWithoutAnUpdateSource() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("builtinctl-fallback-\(UUID().uuidString)", isDirectory: true)
+        let fallback = root.appendingPathComponent("builtinctl")
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let selected = try AgentManager.prepareAutomaticExecutable(
+            fallback: fallback,
+            sourceRecordURL: root.appendingPathComponent("missing-update-source"),
+            versionsDirectory: root.appendingPathComponent("versions")
+        )
+
+        XCTAssertEqual(selected, fallback)
     }
 
     func testAgentPropertyListSerializesAsXML() throws {
