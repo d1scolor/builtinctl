@@ -45,4 +45,63 @@ final class LifecycleTests: XCTestCase {
         XCTAssertEqual(format, .xml)
         XCTAssertEqual(decoded?["Label"] as? String, AgentManager.label)
     }
+
+    func testPurgeRemovesManagedDirectoriesAndLeavesUnrelatedFiles() throws {
+        let manager = FileManager.default
+        let root = manager.temporaryDirectory
+            .appendingPathComponent("builtinctl-purge-\(UUID().uuidString)", isDirectory: true)
+        let applicationDirectory = root.appendingPathComponent("application", isDirectory: true)
+        let logsDirectory = root.appendingPathComponent("logs", isDirectory: true)
+        let configDirectory = root.appendingPathComponent("config", isDirectory: true)
+        let unrelated = root.appendingPathComponent("keep.txt")
+        defer { try? manager.removeItem(at: root) }
+
+        for directory in [applicationDirectory, logsDirectory, configDirectory] {
+            try manager.createDirectory(at: directory, withIntermediateDirectories: true)
+            try Data("managed".utf8).write(to: directory.appendingPathComponent("file"))
+        }
+        try manager.createDirectory(at: root, withIntermediateDirectories: true)
+        try Data("keep".utf8).write(to: unrelated)
+
+        try AgentManager.removeResidualData(
+            fileManager: manager,
+            applicationDirectory: applicationDirectory,
+            logsDirectory: logsDirectory,
+            configDirectory: configDirectory
+        )
+
+        XCTAssertFalse(manager.fileExists(atPath: applicationDirectory.path))
+        XCTAssertFalse(manager.fileExists(atPath: logsDirectory.path))
+        XCTAssertFalse(manager.fileExists(atPath: configDirectory.path))
+        XCTAssertTrue(manager.fileExists(atPath: unrelated.path))
+    }
+
+    func testPurgeCleanupIsIdempotentWhenDirectoriesAreAbsent() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("builtinctl-purge-absent-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        XCTAssertNoThrow(
+            try AgentManager.removeResidualData(
+                applicationDirectory: root.appendingPathComponent("application"),
+                logsDirectory: root.appendingPathComponent("logs"),
+                configDirectory: root.appendingPathComponent("config")
+            )
+        )
+    }
+
+    func testLaunchctlMissingServiceDetectionIsConservative() {
+        XCTAssertTrue(
+            AgentManager.serviceIsMissing(
+                status: 113,
+                output: "Could not find service \"io.github.builtinctl.auto\" in domain for user gui: 501"
+            )
+        )
+        XCTAssertFalse(
+            AgentManager.serviceIsMissing(status: 1, output: "Operation not permitted")
+        )
+        XCTAssertFalse(
+            AgentManager.serviceIsMissing(status: 0, output: "")
+        )
+    }
 }

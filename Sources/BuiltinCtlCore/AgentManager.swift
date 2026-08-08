@@ -12,6 +12,18 @@ public enum AgentManagerError: LocalizedError {
 }
 
 public struct AgentManager {
+    private struct LaunchctlResult {
+        let status: Int32
+        let stdout: String
+        let stderr: String
+
+        var detail: String {
+            let error = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !error.isEmpty { return error }
+            return stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+    }
+
     public static let label = "io.github.builtinctl.auto"
 
     public static var applicationDirectory: URL {
@@ -42,7 +54,7 @@ public struct AgentManager {
 
         // Stop an older loaded copy before replacing its executable. bootout sends
         // SIGTERM, allowing its normal restoration path to run.
-        _ = try? launchctl(["bootout", "\(domain)/\(Self.label)"])
+        try stopAgentIfLoaded()
 
         try manager.createDirectory(
             at: Self.installedExecutable.deletingLastPathComponent(),
@@ -83,7 +95,7 @@ public struct AgentManager {
 
     public func uninstall() throws {
         let manager = FileManager.default
-        _ = try? launchctl(["bootout", "\(domain)/\(Self.label)"])
+        try stopAgentIfLoaded()
         if manager.fileExists(atPath: Self.plistURL.path) {
             try manager.removeItem(at: Self.plistURL)
         }
@@ -92,8 +104,62 @@ public struct AgentManager {
         }
     }
 
+    /// Remove all per-user builtinctl data after the caller has restored and
+    /// verified the built-in display. Configuration is removed last so the
+    /// suspension sentinel survives any partial cleanup failure.
+    public func purge() throws {
+        try uninstall()
+        try Self.removeResidualData()
+    }
+
+    static func removeResidualData(
+        fileManager manager: FileManager = .default,
+        applicationDirectory: URL = Self.applicationDirectory,
+        logsDirectory: URL = Self.logsDirectory,
+        configDirectory: URL = BuiltinCtlPaths.configDirectory
+    ) throws {
+        for directory in [applicationDirectory, logsDirectory, configDirectory] {
+            if manager.fileExists(atPath: directory.path) {
+                try manager.removeItem(at: directory)
+            }
+        }
+    }
+
+    private func stopAgentIfLoaded() throws {
+        let target = "\(domain)/\(Self.label)"
+        let bootout = try runLaunchctl(["bootout", target])
+        let verification = try runLaunchctl(["print", target])
+
+        if Self.serviceIsMissing(status: verification.status, output: verification.detail) {
+            return
+        }
+        if verification.status == 0 {
+            let reason = bootout.detail.isEmpty ? "launchctl still reports it as loaded" : bootout.detail
+            throw AgentManagerError.command(
+                "LaunchAgent could not be stopped; refusing to remove recovery files: \(reason)"
+            )
+        }
+        throw AgentManagerError.command(
+            "Could not verify that the LaunchAgent stopped; refusing to remove recovery files: \(verification.detail)"
+        )
+    }
+
+    static func serviceIsMissing(status: Int32, output: String) -> Bool {
+        status == 113 && output.localizedCaseInsensitiveContains("could not find service")
+    }
+
     @discardableResult
     private func launchctl(_ arguments: [String]) throws -> String {
+        let result = try runLaunchctl(arguments)
+        guard result.status == 0 else {
+            throw AgentManagerError.command(
+                result.detail.isEmpty ? "launchctl failed with status \(result.status)." : result.detail
+            )
+        }
+        return result.stdout
+    }
+
+    private func runLaunchctl(_ arguments: [String]) throws -> LaunchctlResult {
         let process = Process()
         let output = Pipe()
         let errors = Pipe()
@@ -105,12 +171,11 @@ public struct AgentManager {
         process.waitUntilExit()
         let stdout = String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
         let stderr = String(data: errors.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        guard process.terminationReason == .exit, process.terminationStatus == 0 else {
-            let detail = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard process.terminationReason == .exit else {
             throw AgentManagerError.command(
-                detail.isEmpty ? "launchctl failed with status \(process.terminationStatus)." : detail
+                "launchctl terminated abnormally."
             )
         }
-        return stdout
+        return LaunchctlResult(status: process.terminationStatus, stdout: stdout, stderr: stderr)
     }
 }

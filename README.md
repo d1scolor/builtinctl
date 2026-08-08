@@ -41,6 +41,7 @@ builtinctl watch    print CoreGraphics display events without changing displays
 builtinctl test-off safely test disable with a 15-second confirmation timeout
 builtinctl install-agent   install and start a suspended per-user LaunchAgent
 builtinctl uninstall-agent restore, suspend, and remove the LaunchAgent
+builtinctl purge           restore, remove automation, configuration, and logs
 ```
 
 Automatic mode first attempts to enable the panel and enforces a 60-second recovery window. It then uses CoreGraphics callbacks with a two-second safety watchdog. All changes are session-only; logout or restart should discard them. `SIGINT`, `SIGTERM`, `SIGHUP`, and `SIGQUIT` restore the built-in display before exit.
@@ -91,6 +92,18 @@ builtinctl resume
 
 Logs are written under `~/Library/Logs/builtinctl`. The agent uses conditional `KeepAlive` with `SuccessfulExit=false`, not unconditional restart.
 
+## Upgrade
+
+The LaunchAgent runs a safety copy of the executable rather than a versioned Homebrew Cellar path. Refresh that copy after upgrading:
+
+```sh
+brew upgrade builtinctl
+builtinctl install-agent
+builtinctl resume
+```
+
+`install-agent` restores the built-in and reinstalls the agent suspended, so `resume` remains an explicit opt-in.
+
 ## Recovery
 
 Normally, run either:
@@ -107,6 +120,40 @@ builtinctl uninstall-agent
 ```
 
 As a last resort from macOS Recovery, remove the user's builtinctl LaunchAgent from the Data volume before logging in again.
+
+## Uninstall
+
+`brew uninstall builtinctl` removes only the Homebrew-managed CLI. It does not unload a separately installed LaunchAgent or remove builtinctl's per-user files.
+
+To remove automation while retaining the suspension sentinel and logs for a possible reinstall:
+
+```sh
+builtinctl uninstall-agent
+brew uninstall builtinctl
+```
+
+For complete removal, including configuration and logs:
+
+```sh
+builtinctl purge
+brew uninstall builtinctl
+```
+
+`purge` permanently deletes builtinctl's per-user state and logs. It first suspends automation and verifies that the built-in display is active, then unloads the LaunchAgent and removes its plist, copied executable, configuration, and logs. If restoration or agent removal fails, purge stops before deleting the remaining safety state.
+
+If Homebrew was uninstalled first, the LaunchAgent's safety copy normally remains available:
+
+```sh
+"$HOME/Library/Application Support/builtinctl/bin/builtinctl" purge
+```
+
+If that executable is absent or is an older version without `purge`, reinstall the CLI and complete cleanup in the safe order:
+
+```sh
+brew install d1scolor/tap/builtinctl
+builtinctl purge
+brew uninstall builtinctl
+```
 
 ## Testing
 

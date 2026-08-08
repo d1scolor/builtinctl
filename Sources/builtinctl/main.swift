@@ -4,7 +4,7 @@ import Darwin
 import Dispatch
 import Foundation
 
-private let version = "0.1.0"
+private let version = "0.1.1"
 
 private func yesNo(_ value: Bool) -> String { value ? "yes" : "no" }
 
@@ -81,7 +81,7 @@ private extension String {
 }
 
 private func usage() {
-    print("Usage: builtinctl <status|on|off|auto|suspend|recover|resume|watch|test-off|install-agent|uninstall-agent>")
+    print("Usage: builtinctl <status|on|off|auto|suspend|recover|resume|watch|test-off|install-agent|uninstall-agent|purge>")
 }
 
 private func suspendAndRestore(_ display: DisplayController, reason: String) throws {
@@ -177,6 +177,12 @@ do {
         try suspendAndRestore(display, reason: "uninstalled")
         try AgentManager().uninstall()
         print("LaunchAgent and installed binary removed. Automation remains suspended.")
+    case "purge":
+        try suspendAndRestore(display, reason: "purged")
+        try AgentManager().purge()
+        print("Built-in display enabled.")
+        print("LaunchAgent, copied binary, configuration, and logs removed.")
+        print("The package-manager CLI remains installed; remove it separately if desired.")
     case "_auto-on": try enableAndClearRecovery(display)
     case "_auto-off": try disableWithRecoveryMarker(display, requireAutomationAllowed: true)
     case "--version", "version": print("builtinctl \(version)")
