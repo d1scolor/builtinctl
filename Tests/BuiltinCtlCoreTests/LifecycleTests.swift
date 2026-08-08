@@ -3,6 +3,125 @@ import XCTest
 @testable import BuiltinCtlCore
 
 final class LifecycleTests: XCTestCase {
+    private let currentSession = SystemSessionIdentity(
+        bootTimeSeconds: 1_000,
+        bootTimeMicroseconds: 42,
+        auditSessionID: 50_001
+    )
+
+    private func markerData(_ identity: SystemSessionIdentity?) throws -> Data {
+        try JSONEncoder().encode(DisabledStateMarker(identity: identity))
+    }
+
+    private func crashSuspensionData(_ identity: SystemSessionIdentity?) throws -> Data {
+        try JSONEncoder().encode(CrashSuspensionMarker(identity: identity))
+    }
+
+    func testDisabledMarkerFromSameSessionRequiresConservativeRecovery() throws {
+        XCTAssertEqual(
+            disabledStateOrigin(
+                markerData: try markerData(currentSession),
+                currentIdentity: currentSession
+            ),
+            .sameSession
+        )
+    }
+
+    func testDisabledMarkerFromDifferentBootIsPriorSession() throws {
+        let priorBoot = SystemSessionIdentity(
+            bootTimeSeconds: currentSession.bootTimeSeconds - 500,
+            bootTimeMicroseconds: currentSession.bootTimeMicroseconds,
+            auditSessionID: currentSession.auditSessionID
+        )
+
+        XCTAssertEqual(
+            disabledStateOrigin(
+                markerData: try markerData(priorBoot),
+                currentIdentity: currentSession
+            ),
+            .priorSession
+        )
+    }
+
+    func testDisabledMarkerFromDifferentLoginIsPriorSession() throws {
+        let priorLogin = SystemSessionIdentity(
+            bootTimeSeconds: currentSession.bootTimeSeconds,
+            bootTimeMicroseconds: currentSession.bootTimeMicroseconds,
+            auditSessionID: currentSession.auditSessionID - 1
+        )
+
+        XCTAssertEqual(
+            disabledStateOrigin(
+                markerData: try markerData(priorLogin),
+                currentIdentity: currentSession
+            ),
+            .priorSession
+        )
+    }
+
+    func testLegacyCorruptAndUnavailableIdentityMarkersAreUnknown() throws {
+        XCTAssertEqual(
+            disabledStateOrigin(
+                markerData: Data("disabled\n".utf8),
+                currentIdentity: currentSession
+            ),
+            .unknown
+        )
+        XCTAssertEqual(
+            disabledStateOrigin(
+                markerData: try markerData(nil),
+                currentIdentity: currentSession
+            ),
+            .unknown
+        )
+        XCTAssertEqual(
+            disabledStateOrigin(
+                markerData: try markerData(currentSession),
+                currentIdentity: nil
+            ),
+            .unknown
+        )
+    }
+
+    func testCrashSuspensionCanBeClearedOnlyInANewSession() throws {
+        let priorSession = SystemSessionIdentity(
+            bootTimeSeconds: currentSession.bootTimeSeconds,
+            bootTimeMicroseconds: currentSession.bootTimeMicroseconds,
+            auditSessionID: currentSession.auditSessionID - 1
+        )
+
+        XCTAssertEqual(
+            crashSuspensionOrigin(
+                markerData: try crashSuspensionData(currentSession),
+                currentIdentity: currentSession
+            ),
+            .sameSession
+        )
+        XCTAssertEqual(
+            crashSuspensionOrigin(
+                markerData: try crashSuspensionData(priorSession),
+                currentIdentity: currentSession
+            ),
+            .priorSession
+        )
+    }
+
+    func testUserAndLegacyCrashSuspensionsRemainConservative() {
+        XCTAssertNil(
+            crashSuspensionOrigin(
+                markerData: Data("user\n".utf8),
+                currentIdentity: currentSession
+            )
+        )
+        XCTAssertEqual(
+            crashSuspensionOrigin(
+                markerData: Data("unclean-exit\n".utf8),
+                currentIdentity: currentSession
+            ),
+            .unknown
+        )
+    }
+
     func testRearmRequestMustBeNewerThanTheDaemon() {
         let startedAt = Date(timeIntervalSince1970: 1_000)
 

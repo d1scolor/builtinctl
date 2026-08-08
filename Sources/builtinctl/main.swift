@@ -4,7 +4,7 @@ import Darwin
 import Dispatch
 import Foundation
 
-private let version = "0.1.5"
+private let version = "0.1.6"
 
 private func yesNo(_ value: Bool) -> String { value ? "yes" : "no" }
 

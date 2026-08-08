@@ -45,7 +45,7 @@ builtinctl uninstall-agent restore, suspend, and remove the LaunchAgent
 builtinctl purge           restore, remove automation, configuration, and logs
 ```
 
-Automatic mode first attempts to enable the panel and enforces a 60-second recovery window. An explicit `resume` re-arms a running daemon immediately, clearing the remaining startup grace and any reconnect latch. Automatic mode then uses CoreGraphics callbacks with a two-second safety watchdog. All changes are session-only; logout or restart should discard them. `SIGINT`, `SIGTERM`, `SIGHUP`, and `SIGQUIT` restore the built-in display before exit.
+Automatic mode first attempts to enable the panel and enforces a 60-second startup recovery window. An explicit `resume` re-arms a running daemon immediately, clearing the remaining startup grace and any reconnect latch. Automatic mode then uses CoreGraphics callbacks with a two-second safety watchdog. All changes are session-only; logout or restart should discard them. `SIGINT`, `SIGTERM`, `SIGHUP`, and `SIGQUIT` restore the built-in display before exit.
 
 Automatic mode keeps its event loop isolated from private display mutations. Each transition runs through a short-lived internal helper with a five-second timeout and a cross-process mutation lock. Disabling requires a freshly confirmed active external display, a durable built-in recovery ID, and an inactive kill switch. These conditions are checked again after beginning the transaction and immediately before the private call. The helper verifies the result and reverses an unsafe post-condition. After automatic restoration, a recovery latch prevents another disable until an absent external and subsequent reconnect have both been observed.
 
@@ -61,7 +61,9 @@ Before any disable, builtinctl durably writes:
 ~/.config/builtinctl/builtin-disabled
 ```
 
-It removes this marker only after the built-in is verified active. The LaunchAgent restarts only after an unsuccessful exit. A restarted process that finds the marker restores the panel, creates the persistent suspension sentinel, and continues in fail-open suspended mode. It never automatically rearms after a crash.
+The marker includes the kernel boot time and macOS audit login-session ID. It is removed only after the built-in is verified active. The LaunchAgent restarts only after an unsuccessful exit.
+
+If a restarted process finds a marker from the same boot and login session, it restores the panel, creates a crash suspension carrying the same session identity, and requires an explicit `builtinctl resume`. This prevents an in-session crash loop. If the marker or crash suspension belongs to an earlier boot or login session, the process restores the panel and automatically resumes after the normal 60-second startup grace. A legacy, corrupt, or unverifiable marker takes the conservative same-session path. An existing user-created suspension always remains in force.
 
 Only one `auto` process may hold the automation lock. All display mutations also share a separate lock, preventing a late `off` helper from racing crash recovery. The watchdog uses CoreGraphics' public online/asleep state to distinguish a connected sleeping external from a physical unplug, so display sleep pauses topology evaluation even when workspace sleep notifications are not delivered to the LaunchAgent. On a delivered display or system wake notification, automatic mode restores the built-in and starts a fresh 15-second recovery window.
 

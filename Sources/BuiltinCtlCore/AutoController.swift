@@ -46,25 +46,92 @@ public final class AutoController {
         try? BuiltinCtlPaths.clearRecoveryLatch()
 
         logger.log("builtinctl starting")
+        var startupGraceActive = true
+        let currentIdentity = try? SystemSessionIdentity.current()
         if BuiltinCtlPaths.hasDisabledState {
-            logger.log("unclean disabled state found; restoring and suspending automation")
-            try BuiltinCtlPaths.suspend(reason: "unclean-exit")
-            do {
-                try restoreBuiltin()
-                logger.log("crash recovery restored built-in; automation is suspended")
-            } catch {
-                logger.log("crash recovery failed: \(error.localizedDescription)")
-                throw error
+            let markerOrigin = BuiltinCtlPaths.disabledStateOrigin(
+                currentIdentity: currentIdentity
+            )
+            switch markerOrigin {
+            case .priorSession:
+                logger.log("disabled state from a prior boot or login found; restoring built-in")
+                do {
+                    try restoreBuiltin()
+                    _ = try BuiltinCtlPaths.clearPriorCrashSuspension(
+                        currentIdentity: currentIdentity
+                    )
+                    logger.log("prior-session recovery complete; retaining 60s startup grace")
+                } catch {
+                    try? BuiltinCtlPaths.suspend(reason: "startup-recovery-failed")
+                    logger.log("prior-session recovery failed; automation suspended: \(error.localizedDescription)")
+                    throw error
+                }
+            case .sameSession, .unknown:
+                logger.log(markerOrigin == .sameSession
+                    ? "same-session unclean disabled state found; restoring and suspending automation"
+                    : "unrecognized disabled state found; restoring and suspending automation")
+                var suspensionError: Error?
+                if !BuiltinCtlPaths.isSuspended {
+                    do {
+                        try BuiltinCtlPaths.suspendForUncleanExit(identity: currentIdentity)
+                    } catch {
+                        suspensionError = error
+                        logger.log("could not persist crash suspension; restoring before exit: \(error.localizedDescription)")
+                    }
+                }
+                do {
+                    try restoreBuiltin()
+                } catch {
+                    logger.log("crash recovery failed: \(error.localizedDescription)")
+                    throw error
+                }
+                if let suspensionError {
+                    logger.log("crash recovery restored built-in, but automation cannot remain safely suspended")
+                    throw suspensionError
+                }
+                disableAllowedAt = Date()
+                try BuiltinCtlPaths.writeAtomically(
+                    "\(disableAllowedAt.timeIntervalSince1970)\n",
+                    to: BuiltinCtlPaths.safeUntil
+                )
+                startupGraceActive = false
+                logger.log("crash recovery restored built-in; automation requires explicit resume")
             }
         } else {
+            var startupRestored = false
             do {
                 try restoreBuiltin()
+                startupRestored = true
             } catch {
                 logger.log("startup restore failed; automation suspended: \(error.localizedDescription)")
                 try BuiltinCtlPaths.suspend(reason: "startup-restore-failed")
             }
+            if startupRestored, let crashOrigin = BuiltinCtlPaths.crashSuspensionOrigin(
+                currentIdentity: currentIdentity
+            ) {
+                do {
+                    if crashOrigin == .priorSession {
+                        _ = try BuiltinCtlPaths.clearPriorCrashSuspension(
+                            currentIdentity: currentIdentity
+                        )
+                        logger.log("prior-session crash suspension cleared; retaining 60s startup grace")
+                    } else {
+                        startupGraceActive = false
+                        disableAllowedAt = Date()
+                        try BuiltinCtlPaths.writeAtomically(
+                            "\(disableAllowedAt.timeIntervalSince1970)\n",
+                            to: BuiltinCtlPaths.safeUntil
+                        )
+                        logger.log("same-session or unrecognized crash suspension retained; explicit resume required")
+                    }
+                } catch {
+                    logger.log("crash suspension update warning: \(error.localizedDescription)")
+                }
+            }
         }
-        logger.log("entering 60s safe mode")
+        logger.log(startupGraceActive
+            ? "entering 60s startup grace"
+            : "startup grace inactive while automation is suspended")
 
         watcher = DisplayWatcher { [weak self] _, flags in
             guard !flags.contains(.beginConfigurationFlag) else { return }

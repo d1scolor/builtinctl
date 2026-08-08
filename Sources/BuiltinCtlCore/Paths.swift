@@ -54,8 +54,52 @@ public enum BuiltinCtlPaths {
         try writeAtomically("\(reason)\n", to: disabled)
     }
 
+    static func suspendForUncleanExit(identity: SystemSessionIdentity?) throws {
+        let marker = CrashSuspensionMarker(identity: identity)
+        let data = try JSONEncoder().encode(marker)
+        guard let text = String(data: data, encoding: .utf8) else {
+            throw CocoaError(.fileWriteInapplicableStringEncoding)
+        }
+        try writeAtomically("\(text)\n", to: disabled)
+    }
+
     public static func markBuiltinDisabled() throws {
-        try writeAtomically("disabled\n", to: disabledState)
+        let marker = DisabledStateMarker(identity: try? SystemSessionIdentity.current())
+        let data = try JSONEncoder().encode(marker)
+        guard let text = String(data: data, encoding: .utf8) else {
+            throw CocoaError(.fileWriteInapplicableStringEncoding)
+        }
+        try writeAtomically("\(text)\n", to: disabledState)
+    }
+
+    static func disabledStateOrigin(
+        currentIdentity: SystemSessionIdentity? = try? SystemSessionIdentity.current()
+    ) -> DisabledStateOrigin {
+        guard let data = try? Data(contentsOf: disabledState) else { return .unknown }
+        return BuiltinCtlCore.disabledStateOrigin(
+            markerData: data,
+            currentIdentity: currentIdentity
+        )
+    }
+
+    static func crashSuspensionOrigin(
+        currentIdentity: SystemSessionIdentity?
+    ) -> DisabledStateOrigin? {
+        guard let data = try? Data(contentsOf: disabled) else { return nil }
+        return BuiltinCtlCore.crashSuspensionOrigin(
+            markerData: data,
+            currentIdentity: currentIdentity
+        )
+    }
+
+    static func clearPriorCrashSuspension(
+        currentIdentity: SystemSessionIdentity?
+    ) throws -> Bool {
+        guard crashSuspensionOrigin(currentIdentity: currentIdentity) == .priorSession else {
+            return false
+        }
+        try FileManager.default.removeItem(at: disabled)
+        return true
     }
 
     public static func clearBuiltinDisabledMarker() throws {
