@@ -1,0 +1,61 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish Apple Silicon release
+    runs-on: macos-15
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Test
+        run: swift test
+
+      - name: Build release executable
+        run: swift build -c release
+
+      - name: Validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="${GITHUB_REF_NAME#v}"
+          actual_version="$(.build/release/builtinctl --version | awk '{print $2}')"
+          if [[ "$actual_version" != "$version" ]]; then
+            echo "Tag version $version does not match builtinctl version $actual_version" >&2
+            exit 1
+          fi
+
+          file .build/release/builtinctl | grep -q "arm64"
+          codesign --verify --strict --verbose=2 .build/release/builtinctl
+
+          archive="builtinctl-${version}-macos-arm64.tar.gz"
+          mkdir -p dist/staging
+          cp .build/release/builtinctl README.md LICENSE dist/staging/
+          COPYFILE_DISABLE=1 tar -C dist/staging -czf "dist/$archive" \
+            builtinctl README.md LICENSE
+          shasum -a 256 "dist/$archive" > "dist/$archive.sha256"
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* \
+              --verify-tag \
+              --generate-notes \
+              --title "builtinctl ${GITHUB_REF_NAME#v}"
+          fi

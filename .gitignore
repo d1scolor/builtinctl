@@ -1,0 +1,7 @@
+.DS_Store
+.build/
+.swiftpm/
+dist/
+
+# Local implementation brief; the public README is the maintained documentation.
+builtinctl-coding-agent-handoff.md

@@ -1,0 +1,275 @@
+import AppKit
+import CoreGraphics
+import Darwin
+import Dispatch
+import Foundation
+
+public final class AutoController {
+    public static let startupGrace: TimeInterval = 60
+    private let display: DisplayController
+    private let logger: Logger
+    private let executableURL: URL
+    private let startedAt = Date()
+    private var disableAllowedAt: Date
+    private var watcher: DisplayWatcher?
+    private var pending: DispatchWorkItem?
+    private var watchdog: DispatchSourceTimer?
+    private var signals: [DispatchSourceSignal] = []
+    private var lastSummary: String?
+    private var waitingForExternalReconnect = false
+    private var disablingExternalIDs: Set<CGDirectDisplayID> = []
+    private var stopping = false
+    private var processLock: ProcessLock?
+    private var wakeObserver: NSObjectProtocol?
+
+    public init(
+        display: DisplayController = DisplayController(),
+        logger: Logger = Logger(),
+        executableURL: URL? = nil
+    ) {
+        self.display = display
+        self.logger = logger
+        self.disableAllowedAt = Date().addingTimeInterval(Self.startupGrace)
+        self.executableURL = executableURL ?? URL(
+            fileURLWithPath: CommandLine.arguments[0],
+            relativeTo: URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        ).standardizedFileURL
+    }
+
+    public func run() throws -> Never {
+        try BuiltinCtlPaths.ensureDirectory()
+        processLock = try ProcessLock(url: BuiltinCtlPaths.lock, purpose: "automatic-mode process")
+        try BuiltinCtlPaths.writeAtomically("\(getpid())\n", to: BuiltinCtlPaths.pid)
+        try BuiltinCtlPaths.writeAtomically("\(startedAt.timeIntervalSince1970)\n", to: BuiltinCtlPaths.started)
+        try BuiltinCtlPaths.writeAtomically("\(disableAllowedAt.timeIntervalSince1970)\n", to: BuiltinCtlPaths.safeUntil)
+
+        logger.log("builtinctl starting")
+        if BuiltinCtlPaths.hasDisabledState {
+            logger.log("unclean disabled state found; restoring and suspending automation")
+            try BuiltinCtlPaths.suspend(reason: "unclean-exit")
+            do {
+                try restoreBuiltin()
+                logger.log("crash recovery restored built-in; automation is suspended")
+            } catch {
+                logger.log("crash recovery failed: \(error.localizedDescription)")
+                throw error
+            }
+        } else {
+            do {
+                try restoreBuiltin()
+            } catch {
+                logger.log("startup restore failed; automation suspended: \(error.localizedDescription)")
+                try BuiltinCtlPaths.suspend(reason: "startup-restore-failed")
+            }
+        }
+        logger.log("entering 60s safe mode")
+
+        watcher = DisplayWatcher { [weak self] _, flags in
+            guard !flags.contains(.beginConfigurationFlag) else { return }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.logger.log("display reconfiguration flags=\(flags.rawValue)")
+                self.schedule(flags.contains(.removeFlag) ? 0.075 : 0.2)
+            }
+        }
+        try watcher?.start()
+        installSignalHandlers()
+        installWakeObserver()
+
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + 2, repeating: 2)
+        // The timer deliberately retains the controller for the lifetime of auto mode.
+        // `run()` never returns, and all other asynchronous handlers may otherwise be
+        // weak references to a temporary AutoController created by the CLI.
+        timer.setEventHandler { [self] in evaluate() }
+        timer.resume()
+        watchdog = timer
+
+        dispatchMain()
+    }
+
+    private func schedule(_ delay: TimeInterval) {
+        pending?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.evaluate() }
+        pending = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
+    private func evaluate() {
+        guard !stopping else { return }
+        do {
+            let snapshot = try display.snapshot()
+            let armed = Date() >= disableAllowedAt
+            let suspended = BuiltinCtlPaths.isSuspended
+            let activeExternalIDs = Set(snapshot.activeExternals)
+            let trackedExternalRemains = disablingExternalIDs.isEmpty
+                || !disablingExternalIDs.isDisjoint(with: activeExternalIDs)
+            let externalCount = trackedExternalRemains ? activeExternalIDs.count : 0
+            let topologyValid = true
+
+            // After any automatic restoration, observe a truly external-free state
+            // before allowing another disable. This prevents an uncertain detector
+            // from producing an enable/disable loop.
+            if waitingForExternalReconnect && snapshot.builtinActive {
+                if snapshot.activeExternals.isEmpty {
+                    waitingForExternalReconnect = false
+                    logger.log("external removal confirmed; automation ready for reconnect")
+                } else {
+                    let summary = "builtin=true externals=\(snapshot.activeExternals.count) source=cg recovery-latched=true armed=\(armed) suspended=\(suspended)"
+                    if summary != lastSummary { logger.log(summary); lastSummary = summary }
+                    return
+                }
+            }
+            let state = TopologyState(
+                builtinFound: snapshot.builtin != nil,
+                builtinActive: snapshot.builtinActive,
+                activeExternalCount: externalCount,
+                automationArmed: armed,
+                suspended: suspended,
+                topologyValid: topologyValid
+            )
+            let summary = "builtin=\(state.builtinActive) externals=\(state.activeExternalCount) source=cg valid=\(topologyValid) armed=\(armed) suspended=\(suspended)"
+            if summary != lastSummary { logger.log(summary); lastSummary = summary }
+
+            let desired = desiredState(for: state)
+            if desired == .disabled && state.builtinActive {
+                disablingExternalIDs = activeExternalIDs
+                try BuiltinCtlPaths.markBuiltinDisabled()
+                try mutateBuiltin(enabled: false)
+                logger.log("built-in disabled id=\(snapshot.builtin!)")
+            } else if desired == .enabled && !state.builtinActive && state.builtinFound {
+                try restoreBuiltin()
+                waitingForExternalReconnect = true
+                logger.log("built-in enabled id=\(snapshot.builtin!)")
+            } else if desired == .enabled && state.builtinActive && BuiltinCtlPaths.hasDisabledState {
+                try BuiltinCtlPaths.clearBuiltinDisabledMarker()
+                disablingExternalIDs.removeAll()
+            }
+        } catch {
+            logger.log("evaluation error: \(error.localizedDescription)")
+            do {
+                try restoreBuiltin()
+                waitingForExternalReconnect = true
+            } catch {
+                logger.log("fail-open restore warning: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    /// Keep the event loop isolated from private API failures. The helper repeats
+    /// topology and kill-switch validation under a cross-process mutation lock.
+    private func mutateBuiltin(enabled: Bool) throws {
+        try runHelper(enabled ? "_auto-on" : "_auto-off")
+    }
+
+    private func runHelper(_ command: String, timeout: TimeInterval = 5) throws {
+        let process = Process()
+        let output = Pipe()
+        let errors = Pipe()
+        process.executableURL = executableURL
+        process.arguments = [command]
+        process.standardOutput = output
+        process.standardError = errors
+        let completed = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in completed.signal() }
+        try process.run()
+        if completed.wait(timeout: .now() + timeout) == .timedOut {
+            process.terminate()
+            if completed.wait(timeout: .now() + 1) == .timedOut {
+                kill(process.processIdentifier, SIGKILL)
+            }
+            throw NSError(
+                domain: "builtinctl.helper",
+                code: Int(ETIMEDOUT),
+                userInfo: [NSLocalizedDescriptionKey: "display helper timed out"]
+            )
+        }
+        guard process.terminationReason == .exit, process.terminationStatus == 0 else {
+            let data = errors.fileHandleForReading.readDataToEndOfFile()
+            let detail = String(data: data, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            throw NSError(
+                domain: "builtinctl.helper",
+                code: Int(process.terminationStatus),
+                userInfo: [NSLocalizedDescriptionKey: detail?.isEmpty == false ? detail! : "display helper failed"]
+            )
+        }
+    }
+
+    private func restoreBuiltin() throws {
+        do {
+            try mutateBuiltin(enabled: true)
+        } catch {
+            // Enabling is fail-open. If spawning the isolated helper fails, use the
+            // already-running controller as an independent recovery path.
+            try display.setBuiltinEnabled(true)
+        }
+        let restored = try display.snapshot()
+        guard restored.builtin != nil, restored.builtinActive else {
+            throw DisplayError.postcondition("built-in display was not restored.")
+        }
+        try BuiltinCtlPaths.clearBuiltinDisabledMarker()
+        disablingExternalIDs.removeAll()
+    }
+
+    private func installSignalHandlers() {
+        for number in [SIGINT, SIGTERM, SIGHUP, SIGQUIT] {
+            signal(number, SIG_IGN)
+            let source = DispatchSource.makeSignalSource(signal: number, queue: .main)
+            source.setEventHandler { [weak self] in self?.stop(signal: number) }
+            source.resume()
+            signals.append(source)
+        }
+    }
+
+    private func installWakeObserver() {
+        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.handleWake()
+        }
+    }
+
+    private func handleWake() {
+        guard !stopping else { return }
+        logger.log("system wake; restoring built-in and entering 15s recovery window")
+        disableAllowedAt = Date().addingTimeInterval(15)
+        try? BuiltinCtlPaths.writeAtomically(
+            "\(disableAllowedAt.timeIntervalSince1970)\n",
+            to: BuiltinCtlPaths.safeUntil
+        )
+        do {
+            try restoreBuiltin()
+            waitingForExternalReconnect = false
+        } catch {
+            logger.log("wake restore failed; automation suspended: \(error.localizedDescription)")
+            try? BuiltinCtlPaths.suspend(reason: "wake-restore-failed")
+        }
+    }
+
+    private func stop(signal number: Int32) -> Never {
+        stopping = true
+        pending?.cancel()
+        watchdog?.cancel()
+        watcher?.stop()
+        if let wakeObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(wakeObserver)
+            self.wakeObserver = nil
+        }
+        var exitStatus: Int32 = 0
+        do {
+            try restoreBuiltin()
+            logger.log("built-in restored on exit")
+        } catch {
+            exitStatus = 1
+            logger.log("exit restore warning: \(error.localizedDescription)")
+        }
+        try? FileManager.default.removeItem(at: BuiltinCtlPaths.pid)
+        try? FileManager.default.removeItem(at: BuiltinCtlPaths.started)
+        try? FileManager.default.removeItem(at: BuiltinCtlPaths.safeUntil)
+        logger.log("stopping on signal \(number)")
+        Darwin.exit(exitStatus)
+    }
+}
