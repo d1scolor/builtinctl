@@ -22,7 +22,6 @@ public final class AutoController {
     private var stopping = false
     private var processLock: ProcessLock?
     private var workspaceObservers: [NSObjectProtocol] = []
-    private var displaysAsleep = false
 
     public init(
         display: DisplayController = DisplayController(),
@@ -101,16 +100,21 @@ public final class AutoController {
     private func evaluate() {
         guard !stopping else { return }
         applyExplicitRearmIfRequested()
-        guard !displaysAsleep else {
-            let summary = "displays-asleep=true automation-paused=true"
-            if summary != lastSummary { logger.log(summary); lastSummary = summary }
-            return
-        }
         do {
             let snapshot = try display.snapshot()
             let armed = Date() >= disableAllowedAt
             let suspended = BuiltinCtlPaths.isSuspended
             let activeExternalIDs = Set(snapshot.activeExternals)
+            let sleepingExternalIDs = Set(snapshot.sleepingExternals)
+            if shouldPauseForSleepingExternal(
+                activeExternalIDs: activeExternalIDs,
+                trackedExternalIDs: disablingExternalIDs,
+                sleepingExternalIDs: sleepingExternalIDs
+            ) {
+                let summary = "builtin=\(snapshot.builtinActive) externals=0 source=cg external-sleep=true automation-paused=true"
+                if summary != lastSummary { logger.log(summary); lastSummary = summary }
+                return
+            }
             let trackedExternalRemains = disablingExternalIDs.isEmpty
                 || !disablingExternalIDs.isDisjoint(with: activeExternalIDs)
             let externalCount = trackedExternalRemains ? activeExternalIDs.count : 0
@@ -286,16 +290,14 @@ public final class AutoController {
     }
 
     private func handleDisplaysSleep() {
-        guard !stopping, !displaysAsleep else { return }
-        displaysAsleep = true
+        guard !stopping else { return }
         pending?.cancel()
         lastSummary = nil
-        logger.log("displays sleeping; topology evaluation paused")
+        logger.log("display-sleep notification received; polling will verify topology")
     }
 
     private func handleWake(reason: String) {
         guard !stopping else { return }
-        displaysAsleep = false
         lastSummary = nil
         logger.log("\(reason); restoring built-in and entering 15s recovery window")
         disableAllowedAt = Date().addingTimeInterval(15)

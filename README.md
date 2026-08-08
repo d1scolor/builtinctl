@@ -63,7 +63,7 @@ Before any disable, builtinctl durably writes:
 
 It removes this marker only after the built-in is verified active. The LaunchAgent restarts only after an unsuccessful exit. A restarted process that finds the marker restores the panel, creates the persistent suspension sentinel, and continues in fail-open suspended mode. It never automatically rearms after a crash.
 
-Only one `auto` process may hold the automation lock. All display mutations also share a separate lock, preventing a late `off` helper from racing crash recovery. Display sleep pauses topology evaluation so temporarily inactive displays are not mistaken for an unplug. On display or system wake, automatic mode restores the built-in and starts a fresh 15-second recovery window.
+Only one `auto` process may hold the automation lock. All display mutations also share a separate lock, preventing a late `off` helper from racing crash recovery. The watchdog uses CoreGraphics' public online/asleep state to distinguish a connected sleeping external from a physical unplug, so display sleep pauses topology evaluation even when workspace sleep notifications are not delivered to the LaunchAgent. On a delivered display or system wake notification, automatic mode restores the built-in and starts a fresh 15-second recovery window.
 
 ## Safe first run
 

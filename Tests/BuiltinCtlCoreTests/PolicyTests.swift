@@ -2,6 +2,33 @@ import XCTest
 @testable import BuiltinCtlCore
 
 final class PolicyTests: XCTestCase {
+    func testPausesWhenTrackedExternalIsOnlineButAsleep() {
+        XCTAssertTrue(
+            shouldPauseForSleepingExternal(
+                activeExternalIDs: [],
+                trackedExternalIDs: [3],
+                sleepingExternalIDs: [3]
+            )
+        )
+    }
+
+    func testDoesNotConfusePhysicalRemovalWithDisplaySleep() {
+        XCTAssertFalse(
+            shouldPauseForSleepingExternal(
+                activeExternalIDs: [],
+                trackedExternalIDs: [3],
+                sleepingExternalIDs: []
+            )
+        )
+        XCTAssertFalse(
+            shouldPauseForSleepingExternal(
+                activeExternalIDs: [4],
+                trackedExternalIDs: [3, 4],
+                sleepingExternalIDs: [3]
+            )
+        )
+    }
+
     private let safe = TopologyState(
         builtinFound: true, builtinActive: true, activeExternalCount: 1,
         automationArmed: true, suspended: false, topologyValid: true

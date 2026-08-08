@@ -13,6 +13,14 @@ public struct DisplaySnapshot {
         }
     }
 
+    public var sleepingExternals: [CGDirectDisplayID] {
+        online.filter {
+            CGDisplayIsBuiltin($0) == 0
+                && !DisplayIdentity.isUnplugPlaceholder($0)
+                && CGDisplayIsAsleep($0) != 0
+        }
+    }
+
     public var builtinActive: Bool {
         guard let builtin else { return false }
         return active.contains(builtin)

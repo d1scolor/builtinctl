@@ -39,3 +39,17 @@ public func desiredState(for state: TopologyState) -> DesiredBuiltinState {
     }
     return .disabled
 }
+
+/// A sleeping display temporarily leaves the active list without being
+/// physically disconnected. Pause only when all active externals disappeared
+/// and at least one external involved in the prior disable remains online and
+/// is explicitly reported asleep by CoreGraphics.
+public func shouldPauseForSleepingExternal(
+    activeExternalIDs: Set<UInt32>,
+    trackedExternalIDs: Set<UInt32>,
+    sleepingExternalIDs: Set<UInt32>
+) -> Bool {
+    activeExternalIDs.isEmpty
+        && !trackedExternalIDs.isEmpty
+        && !trackedExternalIDs.isDisjoint(with: sleepingExternalIDs)
+}
