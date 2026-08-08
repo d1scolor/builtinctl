@@ -30,10 +30,7 @@ public final class AutoController {
         self.display = display
         self.logger = logger
         self.disableAllowedAt = Date().addingTimeInterval(Self.startupGrace)
-        self.executableURL = executableURL ?? URL(
-            fileURLWithPath: CommandLine.arguments[0],
-            relativeTo: URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-        ).standardizedFileURL
+        self.executableURL = executableURL ?? ExecutableLocator.current()
     }
 
     public func run() throws -> Never {

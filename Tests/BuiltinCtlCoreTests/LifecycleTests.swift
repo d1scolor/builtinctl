@@ -3,6 +3,49 @@ import XCTest
 @testable import BuiltinCtlCore
 
 final class LifecycleTests: XCTestCase {
+    func testCurrentExecutableLocatorReturnsAnAbsoluteExecutablePath() {
+        let executable = ExecutableLocator.current()
+
+        XCTAssertTrue(executable.path.hasPrefix("/"))
+        XCTAssertTrue(FileManager.default.isExecutableFile(atPath: executable.path))
+    }
+
+    func testExecutableLocatorPrefersThePathReportedByMacOS() {
+        let resolved = ExecutableLocator.resolve(
+            reportedExecutablePath: "/opt/homebrew/Cellar/builtinctl/0.1.2/bin/builtinctl",
+            argument0: "builtinctl",
+            currentDirectoryPath: "/Users/example",
+            environmentPath: "/opt/homebrew/bin:/usr/bin"
+        )
+
+        XCTAssertEqual(
+            resolved.path,
+            "/opt/homebrew/Cellar/builtinctl/0.1.2/bin/builtinctl"
+        )
+    }
+
+    func testExecutableLocatorFindsBareCommandNameOnPathAsFallback() throws {
+        let manager = FileManager.default
+        let root = manager.temporaryDirectory
+            .appendingPathComponent("builtinctl-executable-\(UUID().uuidString)", isDirectory: true)
+        let bin = root.appendingPathComponent("bin", isDirectory: true)
+        let executable = bin.appendingPathComponent("builtinctl")
+        defer { try? manager.removeItem(at: root) }
+
+        try manager.createDirectory(at: bin, withIntermediateDirectories: true)
+        try Data("test".utf8).write(to: executable)
+        try manager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+
+        let resolved = ExecutableLocator.resolve(
+            reportedExecutablePath: nil,
+            argument0: "builtinctl",
+            currentDirectoryPath: root.path,
+            environmentPath: "/usr/bin:\(bin.path)"
+        )
+
+        XCTAssertEqual(resolved.path, executable.path)
+    }
+
     func testSingletonLockRejectsSecondOwner() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("builtinctl-lock-\(UUID().uuidString)", isDirectory: true)

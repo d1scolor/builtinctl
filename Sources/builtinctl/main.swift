@@ -4,7 +4,7 @@ import Darwin
 import Dispatch
 import Foundation
 
-private let version = "0.1.1"
+private let version = "0.1.2"
 
 private func yesNo(_ value: Bool) -> String { value ? "yes" : "no" }
 
@@ -132,13 +132,6 @@ private func testOff(_ display: DisplayController) throws {
     }
 }
 
-private func currentExecutableURL() -> URL {
-    URL(
-        fileURLWithPath: CommandLine.arguments[0],
-        relativeTo: URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-    ).standardizedFileURL
-}
-
 let arguments = Array(CommandLine.arguments.dropFirst())
 guard arguments.count == 1 else { usage(); exit(64) }
 let command = arguments[0]
@@ -170,7 +163,7 @@ do {
     case "test-off": try testOff(display)
     case "install-agent":
         try suspendAndRestore(display, reason: "installed-suspended")
-        try AgentManager().install(executable: currentExecutableURL())
+        try AgentManager().install(executable: ExecutableLocator.current())
         print("LaunchAgent installed and started in suspended mode.")
         print("Run '\(AgentManager.installedExecutable.path) resume' when you are ready to enable automatic switching.")
     case "uninstall-agent":
