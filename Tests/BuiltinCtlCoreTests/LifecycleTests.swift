@@ -161,6 +161,28 @@ final class LifecycleTests: XCTestCase {
         )
     }
 
+    func testInitialGraphicsCapabilitySnapshotDoesNotBecomeAWakeTransition() {
+        let cpu = UInt32(kIOPMSystemCapabilityCPU)
+        let graphics = UInt32(kIOPMSystemCapabilityGraphics)
+
+        XCTAssertEqual(
+            systemCapabilityEvent(
+                changeFlags: 0,
+                fromCapabilities: 0,
+                toCapabilities: cpu | graphics
+            ),
+            .initialGraphicsAvailable
+        )
+        XCTAssertEqual(
+            systemCapabilityEvent(
+                changeFlags: 0,
+                fromCapabilities: 0,
+                toCapabilities: cpu
+            ),
+            .initialGraphicsUnavailable
+        )
+    }
+
     func testOnlySleepRequestMessagesRequireAcknowledgement() {
         XCTAssertTrue(systemPowerMessageRequiresAcknowledgement(0xe000_0270))
         XCTAssertTrue(systemPowerMessageRequiresAcknowledgement(0xe000_0280))

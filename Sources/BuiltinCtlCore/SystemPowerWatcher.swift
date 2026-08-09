@@ -4,6 +4,8 @@ import IOKit
 import IOKit.pwr_mgt
 
 enum SystemPowerEvent: Equatable {
+    case initialGraphicsAvailable
+    case initialGraphicsUnavailable
     case sleepPending
     case sleepCancelled
     case poweringOn
@@ -46,6 +48,11 @@ func systemCapabilityEvent(
     let graphics = UInt32(kIOPMSystemCapabilityGraphics)
     let hadGraphics = fromCapabilities & graphics != 0
     let willHaveGraphics = toCapabilities & graphics != 0
+    let transitionFlags = UInt32(kIOPMSystemCapabilityWillChange)
+        | UInt32(kIOPMSystemCapabilityDidChange)
+    if changeFlags & transitionFlags == 0 {
+        return willHaveGraphics ? .initialGraphicsAvailable : .initialGraphicsUnavailable
+    }
     guard hadGraphics != willHaveGraphics else { return nil }
 
     if !willHaveGraphics {

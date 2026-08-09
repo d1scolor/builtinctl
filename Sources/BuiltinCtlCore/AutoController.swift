@@ -381,6 +381,14 @@ public final class AutoController {
     private func handleSystemPowerEvent(_ event: SystemPowerEvent) {
         guard !stopping else { return }
         switch event {
+        case .initialGraphicsAvailable:
+            graphicsUnavailable = false
+            lastSummary = nil
+            logger.log("initial graphics capability available")
+        case .initialGraphicsUnavailable:
+            graphicsUnavailable = true
+            lastSummary = nil
+            logger.log("initial graphics capability unavailable; automation paused")
         case .sleepPending:
             pending?.cancel()
             if !systemSleepPending {
@@ -397,6 +405,10 @@ public final class AutoController {
                 schedule(0.2)
             }
         case .poweringOn:
+            guard systemSleepPending || graphicsUnavailable else {
+                logger.log("power-on transition ignored without preceding sleep")
+                return
+            }
             systemSleepPending = true
             lastSummary = nil
             logger.log("system power-on started; waiting for hardware")
