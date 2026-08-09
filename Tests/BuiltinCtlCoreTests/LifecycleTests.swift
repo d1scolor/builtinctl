@@ -122,6 +122,52 @@ final class LifecycleTests: XCTestCase {
         )
     }
 
+    func testIOKitPowerMessagesMapToAutomationEvents() {
+        XCTAssertEqual(systemPowerEvent(for: 0xe000_0270), .sleepPending)
+        XCTAssertEqual(systemPowerEvent(for: 0xe000_0280), .sleepPending)
+        XCTAssertEqual(systemPowerEvent(for: 0xe000_0290), .sleepCancelled)
+        XCTAssertEqual(systemPowerEvent(for: 0xe000_0320), .poweringOn)
+        XCTAssertEqual(systemPowerEvent(for: 0xe000_0300), .systemDidWake)
+        XCTAssertNil(systemPowerEvent(for: 0))
+    }
+
+    func testGraphicsCapabilityDistinguishesDarkWakeFromUserWake() {
+        let didChange = UInt32(kIOPMSystemCapabilityDidChange)
+        let cpu = UInt32(kIOPMSystemCapabilityCPU)
+        let graphics = UInt32(kIOPMSystemCapabilityGraphics)
+
+        XCTAssertEqual(
+            systemCapabilityEvent(
+                changeFlags: didChange,
+                fromCapabilities: cpu | graphics,
+                toCapabilities: cpu
+            ),
+            .graphicsUnavailable
+        )
+        XCTAssertNil(
+            systemCapabilityEvent(
+                changeFlags: didChange,
+                fromCapabilities: cpu,
+                toCapabilities: cpu
+            )
+        )
+        XCTAssertEqual(
+            systemCapabilityEvent(
+                changeFlags: didChange,
+                fromCapabilities: cpu,
+                toCapabilities: cpu | graphics
+            ),
+            .graphicsAvailable
+        )
+    }
+
+    func testOnlySleepRequestMessagesRequireAcknowledgement() {
+        XCTAssertTrue(systemPowerMessageRequiresAcknowledgement(0xe000_0270))
+        XCTAssertTrue(systemPowerMessageRequiresAcknowledgement(0xe000_0280))
+        XCTAssertFalse(systemPowerMessageRequiresAcknowledgement(0xe000_0290))
+        XCTAssertFalse(systemPowerMessageRequiresAcknowledgement(0xe000_0300))
+    }
+
     func testRearmRequestMustBeNewerThanTheDaemon() {
         let startedAt = Date(timeIntervalSince1970: 1_000)
 

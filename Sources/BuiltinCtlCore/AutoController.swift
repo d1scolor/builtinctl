@@ -15,11 +15,14 @@ public final class AutoController {
     private var watcher: DisplayWatcher?
     private var pending: DispatchWorkItem?
     private var watchdog: DispatchSourceTimer?
+    private var powerWatcher: SystemPowerWatcher?
     private var signals: [DispatchSourceSignal] = []
     private var lastSummary: String?
     private var waitingForExternalReconnect = false
     private var disablingExternalIDs: Set<CGDirectDisplayID> = []
     private var stopping = false
+    private var systemSleepPending = false
+    private var graphicsUnavailable = false
     private var processLock: ProcessLock?
     private var workspaceObservers: [NSObjectProtocol] = []
 
@@ -142,6 +145,7 @@ public final class AutoController {
             }
         }
         try watcher?.start()
+        installSystemPowerWatcher()
         installSignalHandlers()
         installWorkspaceObservers()
 
@@ -167,6 +171,11 @@ public final class AutoController {
     private func evaluate() {
         guard !stopping else { return }
         applyExplicitRearmIfRequested()
+        if systemSleepPending || graphicsUnavailable {
+            let summary = "power-transition=true graphics-unavailable=\(graphicsUnavailable) automation-paused=true"
+            if summary != lastSummary { logger.log(summary); lastSummary = summary }
+            return
+        }
         do {
             let snapshot = try display.snapshot()
             let armed = Date() >= disableAllowedAt
@@ -356,6 +365,64 @@ public final class AutoController {
         })
     }
 
+    private func installSystemPowerWatcher() {
+        let watcher = SystemPowerWatcher { [weak self] event in
+            self?.handleSystemPowerEvent(event)
+        }
+        do {
+            try watcher.start()
+            powerWatcher = watcher
+            logger.log("IOKit system power monitoring active")
+        } catch {
+            logger.log("IOKit system power monitoring unavailable: \(error.localizedDescription)")
+        }
+    }
+
+    private func handleSystemPowerEvent(_ event: SystemPowerEvent) {
+        guard !stopping else { return }
+        switch event {
+        case .sleepPending:
+            pending?.cancel()
+            if !systemSleepPending {
+                logger.log("system sleep pending; automation paused")
+            }
+            systemSleepPending = true
+            lastSummary = nil
+        case .sleepCancelled:
+            let wasPending = systemSleepPending
+            systemSleepPending = false
+            lastSummary = nil
+            if wasPending {
+                logger.log("system sleep cancelled; automation resumed")
+                schedule(0.2)
+            }
+        case .poweringOn:
+            systemSleepPending = true
+            lastSummary = nil
+            logger.log("system power-on started; waiting for hardware")
+        case .systemDidWake:
+            systemSleepPending = false
+            lastSummary = nil
+            if graphicsUnavailable {
+                logger.log("system woke without graphics; automation remains paused")
+            } else {
+                schedule(0.2)
+            }
+        case .graphicsUnavailable:
+            pending?.cancel()
+            if !graphicsUnavailable {
+                logger.log("graphics capability unavailable; automation paused")
+            }
+            graphicsUnavailable = true
+            lastSummary = nil
+        case .graphicsAvailable:
+            graphicsUnavailable = false
+            systemSleepPending = false
+            lastSummary = nil
+            handleWake(reason: "IOKit graphics wake")
+        }
+    }
+
     private func handleDisplaysSleep() {
         guard !stopping else { return }
         pending?.cancel()
@@ -386,6 +453,8 @@ public final class AutoController {
         pending?.cancel()
         watchdog?.cancel()
         watcher?.stop()
+        powerWatcher?.stop()
+        powerWatcher = nil
         for observer in workspaceObservers {
             NSWorkspace.shared.notificationCenter.removeObserver(observer)
         }
