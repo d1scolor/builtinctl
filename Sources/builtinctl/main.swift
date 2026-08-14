@@ -4,7 +4,7 @@ import Darwin
 import Dispatch
 import Foundation
 
-private let version = "0.1.8"
+private let version = "0.1.9"
 
 private func yesNo(_ value: Bool) -> String { value ? "yes" : "no" }
 
@@ -35,12 +35,16 @@ private func daemonState() -> DaemonState {
 private func status(_ display: DisplayController) throws {
     let state = try display.snapshot()
     let daemon = daemonState()
+    let lidClosed = ClamshellState.current()
+    let lidState = lidClosed.map { $0 ? "closed" : "open" } ?? "unknown"
     print("builtinctl \(version)\n")
     print("Built-in:")
     print("  ID:            \(state.builtin.map { String($0) } ?? "not found")")
     print("  Online:        \(yesNo(state.builtin.map { state.online.contains($0) } ?? false))")
     print("  Active:        \(yesNo(state.builtinActive))")
     print("  Main:          \(yesNo(state.builtin.map { CGDisplayIsMain($0) != 0 } ?? false))\n")
+    print("Laptop:")
+    print("  Lid:           \(lidState)\n")
     print("External:")
     print("  Active count:  \(state.activeExternals.count)")
     print("  IDs:           \(state.activeExternals.map { String($0) }.joined(separator: ", ").nilIfEmpty ?? "none")\n")
@@ -48,6 +52,7 @@ private func status(_ display: DisplayController) throws {
     print("  Suspended:     \(yesNo(BuiltinCtlPaths.isSuspended))")
     print("  Recovery pending: \(yesNo(BuiltinCtlPaths.hasDisabledState))")
     print("  Reconnect required: \(yesNo(BuiltinCtlPaths.isRecoveryLatched))")
+    print("  Clamshell paused: \(lidClosed.map(yesNo) ?? "unknown")")
     print("  Daemon:        \(daemon.running ? "running" : "stopped")")
     let agentVersion = daemon.running ? (daemon.version ?? "unknown (legacy agent)") : "not running"
     let updatePending: String
@@ -157,6 +162,7 @@ private func automaticMode(_ display: DisplayController, usePreferredExecutable:
 }
 
 private func suspendAndRestore(_ display: DisplayController, reason: String) throws {
+    try ClamshellState.requireOpen()
     try BuiltinCtlPaths.suspend(reason: reason)
     try enableAndClearRecovery(display)
 }
@@ -170,6 +176,7 @@ private func disableWithRecoveryMarker(
     _ display: DisplayController,
     requireAutomationAllowed: Bool = false
 ) throws {
+    try ClamshellState.requireOpen()
     try BuiltinCtlPaths.markBuiltinDisabled()
     do {
         try display.setBuiltinEnabled(false, requireAutomationAllowed: requireAutomationAllowed)

@@ -1,6 +1,7 @@
 public enum DesiredBuiltinState: Equatable {
     case enabled
     case disabled
+    case unchanged
 }
 
 public struct TopologyState: Equatable {
@@ -10,6 +11,7 @@ public struct TopologyState: Equatable {
     public var automationArmed: Bool
     public var suspended: Bool
     public var topologyValid: Bool
+    public var lidClosed: Bool
 
     public init(
         builtinFound: Bool,
@@ -17,7 +19,8 @@ public struct TopologyState: Equatable {
         activeExternalCount: Int,
         automationArmed: Bool,
         suspended: Bool,
-        topologyValid: Bool
+        topologyValid: Bool,
+        lidClosed: Bool = false
     ) {
         self.builtinFound = builtinFound
         self.builtinActive = builtinActive
@@ -25,11 +28,14 @@ public struct TopologyState: Equatable {
         self.automationArmed = automationArmed
         self.suspended = suspended
         self.topologyValid = topologyValid
+        self.lidClosed = lidClosed
     }
 }
 
-/// Fail-open policy: every uncertain or unarmed state requests an enabled panel.
+/// Leave clamshell display ownership to macOS. With the lid open, every uncertain
+/// or unarmed state requests an enabled panel.
 public func desiredState(for state: TopologyState) -> DesiredBuiltinState {
+    if state.lidClosed { return .unchanged }
     guard !state.suspended,
           state.automationArmed,
           state.topologyValid,

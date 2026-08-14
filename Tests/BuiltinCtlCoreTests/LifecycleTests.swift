@@ -3,6 +3,24 @@ import XCTest
 @testable import BuiltinCtlCore
 
 final class LifecycleTests: XCTestCase {
+    func testClamshellMessageDecodesOpenAndClosedStates() {
+        XCTAssertEqual(
+            clamshellClosed(
+                messageType: clamshellStateChangeMessage,
+                messageArgument: nil
+            ),
+            false
+        )
+        XCTAssertEqual(
+            clamshellClosed(
+                messageType: clamshellStateChangeMessage,
+                messageArgument: UnsafeMutableRawPointer(bitPattern: 1)
+            ),
+            true
+        )
+        XCTAssertNil(clamshellClosed(messageType: 0, messageArgument: nil))
+    }
+
     private let currentSession = SystemSessionIdentity(
         bootTimeSeconds: 1_000,
         bootTimeMicroseconds: 42,

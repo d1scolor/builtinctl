@@ -4,6 +4,7 @@ import IOKit
 import IOKit.pwr_mgt
 
 enum SystemPowerEvent: Equatable {
+    case clamshellChanged(closed: Bool)
     case initialGraphicsAvailable
     case initialGraphicsUnavailable
     case sleepPending
@@ -82,7 +83,9 @@ final class SystemPowerWatcher {
     private var notifier: io_object_t = 0
     private var capabilityPort: IONotificationPortRef?
     private var capabilityNotifier: io_object_t = 0
+    private var clamshellNotifier: io_object_t = 0
     private var rootPowerService: io_service_t = 0
+    private var lastClamshellClosed: Bool?
 
     init(handler: @escaping (SystemPowerEvent) -> Void) {
         self.handler = handler
@@ -133,6 +136,9 @@ final class SystemPowerWatcher {
         if capabilityNotifier != 0 {
             IOObjectRelease(capabilityNotifier)
         }
+        if clamshellNotifier != 0 {
+            IOObjectRelease(clamshellNotifier)
+        }
         if let capabilityPort {
             IONotificationPortDestroy(capabilityPort)
         }
@@ -147,8 +153,10 @@ final class SystemPowerWatcher {
         notifier = 0
         notificationPort = nil
         capabilityNotifier = 0
+        clamshellNotifier = 0
         capabilityPort = nil
         rootPowerService = 0
+        lastClamshellClosed = nil
     }
 
     private func receive(messageType: UInt32, argument: UnsafeMutableRawPointer?) {
@@ -199,10 +207,43 @@ final class SystemPowerWatcher {
             throw SystemPowerWatcherError.registrationFailed
         }
 
+        var registeredClamshellNotifier: io_object_t = 0
+        let clamshellResult = kIOGeneralInterest.withCString { interest in
+            IOServiceAddInterestNotification(
+                port,
+                service,
+                interest,
+                { reference, _, messageType, messageArgument in
+                    guard let reference,
+                          let closed = clamshellClosed(
+                            messageType: messageType,
+                            messageArgument: messageArgument
+                          ) else { return }
+                    Unmanaged<SystemPowerWatcher>
+                        .fromOpaque(reference)
+                        .takeUnretainedValue()
+                        .receiveClamshellState(closed)
+                },
+                Unmanaged.passUnretained(self).toOpaque(),
+                &registeredClamshellNotifier
+            )
+        }
+        guard clamshellResult == kIOReturnSuccess else {
+            if registeredNotifier != 0 { IOObjectRelease(registeredNotifier) }
+            if registeredClamshellNotifier != 0 {
+                IOObjectRelease(registeredClamshellNotifier)
+            }
+            IONotificationPortDestroy(port)
+            IOObjectRelease(service)
+            throw SystemPowerWatcherError.registrationFailed
+        }
+
         rootPowerService = service
         capabilityPort = port
         capabilityNotifier = registeredNotifier
+        clamshellNotifier = registeredClamshellNotifier
         IONotificationPortSetDispatchQueue(port, DispatchQueue.main)
+        receiveClamshellState(from: service)
     }
 
     private func receiveCapabilityChange(
@@ -215,6 +256,17 @@ final class SystemPowerWatcher {
         ) {
             handler(event)
         }
+    }
+
+    private func receiveClamshellState(from service: io_service_t) {
+        guard let closed = ClamshellState.read(from: service) else { return }
+        receiveClamshellState(closed)
+    }
+
+    private func receiveClamshellState(_ closed: Bool) {
+        guard closed != lastClamshellClosed else { return }
+        lastClamshellClosed = closed
+        handler(.clamshellChanged(closed: closed))
     }
 
     deinit {

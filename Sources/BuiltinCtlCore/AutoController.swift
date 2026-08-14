@@ -23,6 +23,8 @@ public final class AutoController {
     private var stopping = false
     private var systemSleepPending = false
     private var graphicsUnavailable = false
+    private var lidClosed: Bool
+    private var lidSettleUntil: Date?
     private var processLock: ProcessLock?
     private var workspaceObservers: [NSObjectProtocol] = []
 
@@ -37,6 +39,7 @@ public final class AutoController {
         self.disableAllowedAt = Date().addingTimeInterval(Self.startupGrace)
         self.executableURL = executableURL ?? ExecutableLocator.current()
         self.runningVersion = runningVersion
+        self.lidClosed = ClamshellState.current() ?? false
     }
 
     public func run() throws -> Never {
@@ -58,6 +61,10 @@ public final class AutoController {
             switch markerOrigin {
             case .priorSession:
                 logger.log("disabled state from a prior boot or login found; restoring built-in")
+                if lidClosed {
+                    logger.log("lid closed; prior-session recovery deferred until lid opens")
+                    break
+                }
                 do {
                     try restoreBuiltin()
                     _ = try BuiltinCtlPaths.clearPriorCrashSuspension(
@@ -65,9 +72,11 @@ public final class AutoController {
                     )
                     logger.log("prior-session recovery complete; retaining 60s startup grace")
                 } catch {
-                    try? BuiltinCtlPaths.suspend(reason: "startup-recovery-failed")
-                    logger.log("prior-session recovery failed; automation suspended: \(error.localizedDescription)")
-                    throw error
+                    if !deferMutationIfLidClosed(error, context: "prior-session recovery") {
+                        try? BuiltinCtlPaths.suspend(reason: "startup-recovery-failed")
+                        logger.log("prior-session recovery failed; automation suspended: \(error.localizedDescription)")
+                        throw error
+                    }
                 }
             case .sameSession, .unknown:
                 logger.log(markerOrigin == .sameSession
@@ -82,9 +91,22 @@ public final class AutoController {
                         logger.log("could not persist crash suspension; restoring before exit: \(error.localizedDescription)")
                     }
                 }
+                if lidClosed {
+                    if let suspensionError { throw suspensionError }
+                    try deactivateStartupGrace()
+                    startupGraceActive = false
+                    logger.log("lid closed; crash recovery deferred until lid opens")
+                    break
+                }
                 do {
                     try restoreBuiltin()
                 } catch {
+                    if deferMutationIfLidClosed(error, context: "crash recovery") {
+                        if let suspensionError { throw suspensionError }
+                        try deactivateStartupGrace()
+                        startupGraceActive = false
+                        break
+                    }
                     logger.log("crash recovery failed: \(error.localizedDescription)")
                     throw error
                 }
@@ -92,24 +114,27 @@ public final class AutoController {
                     logger.log("crash recovery restored built-in, but automation cannot remain safely suspended")
                     throw suspensionError
                 }
-                disableAllowedAt = Date()
-                try BuiltinCtlPaths.writeAtomically(
-                    "\(disableAllowedAt.timeIntervalSince1970)\n",
-                    to: BuiltinCtlPaths.safeUntil
-                )
+                try deactivateStartupGrace()
                 startupGraceActive = false
                 logger.log("crash recovery restored built-in; automation requires explicit resume")
             }
         } else {
             var startupRestored = false
-            do {
-                try restoreBuiltin()
-                startupRestored = true
-            } catch {
-                logger.log("startup restore failed; automation suspended: \(error.localizedDescription)")
-                try BuiltinCtlPaths.suspend(reason: "startup-restore-failed")
+            if lidClosed {
+                logger.log("lid closed; startup display restore deferred until lid opens")
+            } else {
+                do {
+                    try restoreBuiltin()
+                    startupRestored = true
+                } catch {
+                    if !deferMutationIfLidClosed(error, context: "startup display restore") {
+                        logger.log("startup restore failed; automation suspended: \(error.localizedDescription)")
+                        try BuiltinCtlPaths.suspend(reason: "startup-restore-failed")
+                    }
+                }
             }
-            if startupRestored, let crashOrigin = BuiltinCtlPaths.crashSuspensionOrigin(
+            if (startupRestored || lidClosed),
+               let crashOrigin = BuiltinCtlPaths.crashSuspensionOrigin(
                 currentIdentity: currentIdentity
             ) {
                 do {
@@ -120,11 +145,7 @@ public final class AutoController {
                         logger.log("prior-session crash suspension cleared; retaining 60s startup grace")
                     } else {
                         startupGraceActive = false
-                        disableAllowedAt = Date()
-                        try BuiltinCtlPaths.writeAtomically(
-                            "\(disableAllowedAt.timeIntervalSince1970)\n",
-                            to: BuiltinCtlPaths.safeUntil
-                        )
+                        try deactivateStartupGrace()
                         logger.log("same-session or unrecognized crash suspension retained; explicit resume required")
                     }
                 } catch {
@@ -168,14 +189,58 @@ public final class AutoController {
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
+    private func deactivateStartupGrace() throws {
+        disableAllowedAt = Date()
+        try BuiltinCtlPaths.writeAtomically(
+            "\(disableAllowedAt.timeIntervalSince1970)\n",
+            to: BuiltinCtlPaths.safeUntil
+        )
+    }
+
+    /// A lid close can race a topology snapshot or helper launch. Treat that as a
+    /// normal clamshell transition, not as a failed recovery that suspends auto mode.
+    @discardableResult
+    private func deferMutationIfLidClosed(_ error: Error, context: String) -> Bool {
+        let explicitClamshellError: Bool
+        if let displayError = error as? DisplayError,
+           case .clamshellClosed = displayError {
+            explicitClamshellError = true
+        } else {
+            explicitClamshellError = false
+        }
+        guard explicitClamshellError || ClamshellState.current() == true else {
+            return false
+        }
+        lidClosed = true
+        lidSettleUntil = nil
+        pending?.cancel()
+        lastSummary = nil
+        logger.log("lid closed during \(context); display mutation deferred")
+        return true
+    }
+
     private func evaluate() {
         guard !stopping else { return }
         applyExplicitRearmIfRequested()
+        if let currentLidState = ClamshellState.current(), currentLidState != lidClosed {
+            handleClamshellChange(closed: currentLidState)
+        }
         if systemSleepPending || graphicsUnavailable {
             let summary = "power-transition=true graphics-unavailable=\(graphicsUnavailable) automation-paused=true"
             if summary != lastSummary { logger.log(summary); lastSummary = summary }
             return
         }
+        if lidClosed {
+            let summary = "lid-closed=true automation-paused=true"
+            if summary != lastSummary { logger.log(summary); lastSummary = summary }
+            return
+        }
+        if let lidSettleUntil, Date() < lidSettleUntil {
+            let summary = "lid-settling=true automation-paused=true"
+            if summary != lastSummary { logger.log(summary); lastSummary = summary }
+            return
+        }
+        lidSettleUntil = nil
         do {
             let snapshot = try display.snapshot()
             let armed = Date() >= disableAllowedAt
@@ -215,7 +280,8 @@ public final class AutoController {
                 activeExternalCount: externalCount,
                 automationArmed: armed,
                 suspended: suspended,
-                topologyValid: topologyValid
+                topologyValid: topologyValid,
+                lidClosed: lidClosed
             )
             let summary = "builtin=\(state.builtinActive) externals=\(state.activeExternalCount) source=cg valid=\(topologyValid) armed=\(armed) suspended=\(suspended)"
             if summary != lastSummary { logger.log(summary); lastSummary = summary }
@@ -235,12 +301,17 @@ public final class AutoController {
                 disablingExternalIDs.removeAll()
             }
         } catch {
+            if deferMutationIfLidClosed(error, context: "topology evaluation") {
+                return
+            }
             logger.log("evaluation error: \(error.localizedDescription)")
             do {
                 try restoreBuiltin()
                 setRecoveryLatched(true)
             } catch {
-                logger.log("fail-open restore warning: \(error.localizedDescription)")
+                if !deferMutationIfLidClosed(error, context: "fail-open recovery") {
+                    logger.log("fail-open restore warning: \(error.localizedDescription)")
+                }
             }
         }
     }
@@ -381,6 +452,8 @@ public final class AutoController {
     private func handleSystemPowerEvent(_ event: SystemPowerEvent) {
         guard !stopping else { return }
         switch event {
+        case .clamshellChanged(let closed):
+            handleClamshellChange(closed: closed)
         case .initialGraphicsAvailable:
             graphicsUnavailable = false
             lastSummary = nil
@@ -431,8 +504,36 @@ public final class AutoController {
             graphicsUnavailable = false
             systemSleepPending = false
             lastSummary = nil
-            handleWake(reason: "IOKit graphics wake")
+            if lidClosed {
+                logger.log("IOKit graphics wake while lid closed; restoration deferred")
+            } else {
+                handleWake(reason: "IOKit graphics wake")
+            }
         }
+    }
+
+    private func handleClamshellChange(closed: Bool) {
+        guard closed != lidClosed else { return }
+        lidClosed = closed
+        pending?.cancel()
+        lastSummary = nil
+        if closed {
+            lidSettleUntil = nil
+            logger.log("lid closed; display automation paused")
+            return
+        }
+
+        let settleUntil = Date().addingTimeInterval(3)
+        lidSettleUntil = settleUntil
+        if disableAllowedAt < settleUntil {
+            disableAllowedAt = settleUntil
+            try? BuiltinCtlPaths.writeAtomically(
+                "\(disableAllowedAt.timeIntervalSince1970)\n",
+                to: BuiltinCtlPaths.safeUntil
+            )
+        }
+        logger.log("lid opened; reevaluating displays after 3s settle window")
+        schedule(3)
     }
 
     private func handleDisplaysSleep() {
@@ -444,6 +545,12 @@ public final class AutoController {
 
     private func handleWake(reason: String) {
         guard !stopping else { return }
+        if lidClosed || ClamshellState.current() == true {
+            lidClosed = true
+            lastSummary = nil
+            logger.log("\(reason) while lid closed; restoration deferred")
+            return
+        }
         lastSummary = nil
         logger.log("\(reason); restoring built-in and entering 15s recovery window")
         disableAllowedAt = Date().addingTimeInterval(15)
@@ -455,8 +562,10 @@ public final class AutoController {
             try restoreBuiltin()
             setRecoveryLatched(false)
         } catch {
-            logger.log("wake restore failed; automation suspended: \(error.localizedDescription)")
-            try? BuiltinCtlPaths.suspend(reason: "wake-restore-failed")
+            if !deferMutationIfLidClosed(error, context: "wake recovery") {
+                logger.log("wake restore failed; automation suspended: \(error.localizedDescription)")
+                try? BuiltinCtlPaths.suspend(reason: "wake-restore-failed")
+            }
         }
     }
 
@@ -472,12 +581,18 @@ public final class AutoController {
         }
         workspaceObservers.removeAll()
         var exitStatus: Int32 = 0
-        do {
-            try restoreBuiltin()
-            logger.log("built-in restored on exit")
-        } catch {
-            exitStatus = 1
-            logger.log("exit restore warning: \(error.localizedDescription)")
+        if lidClosed || ClamshellState.current() == true {
+            logger.log("lid closed; exit restore deferred to the next open-lid session")
+        } else {
+            do {
+                try restoreBuiltin()
+                logger.log("built-in restored on exit")
+            } catch {
+                if !deferMutationIfLidClosed(error, context: "exit recovery") {
+                    exitStatus = 1
+                    logger.log("exit restore warning: \(error.localizedDescription)")
+                }
+            }
         }
         try? FileManager.default.removeItem(at: BuiltinCtlPaths.pid)
         try? FileManager.default.removeItem(at: BuiltinCtlPaths.started)

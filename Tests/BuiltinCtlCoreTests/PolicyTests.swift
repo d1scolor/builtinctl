@@ -47,4 +47,14 @@ final class PolicyTests: XCTestCase {
         state = safe; state.activeExternalCount = 0; states.append(state)
         for state in states { XCTAssertEqual(desiredState(for: state), .enabled) }
     }
+
+    func testClosedLidLeavesDisplayOwnershipToMacOS() {
+        var state = safe
+        state.lidClosed = true
+        XCTAssertEqual(desiredState(for: state), .unchanged)
+
+        state.activeExternalCount = 0
+        state.builtinActive = false
+        XCTAssertEqual(desiredState(for: state), .unchanged)
+    }
 }

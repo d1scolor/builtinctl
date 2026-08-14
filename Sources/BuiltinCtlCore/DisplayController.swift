@@ -35,6 +35,7 @@ public enum DisplayError: LocalizedError {
     case configuration(CGError)
     case recoveryCache(String)
     case automationSuspended
+    case clamshellClosed
     case postcondition(String)
 
     public var errorDescription: String? {
@@ -46,6 +47,7 @@ public enum DisplayError: LocalizedError {
         case .configuration(let error): return "Display configuration failed (\(error.rawValue))."
         case .recoveryCache(let detail): return "Built-in display recovery ID is not durable: \(detail)"
         case .automationSuspended: return "automatic switching is suspended."
+        case .clamshellClosed: return "the laptop lid is closed; open it before changing the built-in display."
         case .postcondition(let detail): return "Display safety verification failed: \(detail)"
         }
     }
@@ -129,6 +131,7 @@ public final class DisplayController {
         let mutationLock = try ProcessLock(url: BuiltinCtlPaths.mutationLock, purpose: "display mutation")
         defer { withExtendedLifetime(mutationLock) {} }
         guard let configureEnabled else { throw DisplayError.privateAPIUnavailable }
+        try ClamshellState.requireOpen()
 
         if !enabled && requireAutomationAllowed && BuiltinCtlPaths.isSuspended {
             throw DisplayError.automationSuspended
