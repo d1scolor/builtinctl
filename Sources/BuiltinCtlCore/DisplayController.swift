@@ -130,7 +130,6 @@ public final class DisplayController {
         try BuiltinCtlPaths.ensureDirectory()
         let mutationLock = try ProcessLock(url: BuiltinCtlPaths.mutationLock, purpose: "display mutation")
         defer { withExtendedLifetime(mutationLock) {} }
-        guard let configureEnabled else { throw DisplayError.privateAPIUnavailable }
         try ClamshellState.requireOpen()
 
         if !enabled && requireAutomationAllowed && BuiltinCtlPaths.isSuspended {
@@ -143,6 +142,10 @@ public final class DisplayController {
         guard CGDisplayIsBuiltin(builtin) != 0 else { throw DisplayError.builtinNotFound }
         if !enabled && current.activeExternals.isEmpty { throw DisplayError.noActiveExternal }
         if current.builtinActive == enabled { return }
+
+        // Recovery and uninstall must still verify an already-enabled panel if
+        // a macOS update removes the private mutation API.
+        guard let configureEnabled else { throw DisplayError.privateAPIUnavailable }
 
         let expectedExternalIDs = Set(current.activeExternals)
         if !enabled { try requireDurableRecoveryID(builtin) }
